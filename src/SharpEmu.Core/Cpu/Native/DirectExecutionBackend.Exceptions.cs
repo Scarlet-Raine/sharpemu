@@ -147,10 +147,21 @@ public sealed partial class DirectExecutionBackend
 				return 0;
 			}
 
+			Span<byte> faultInstructionBytes = stackalloc byte[16];
+			var capturedFaultInstruction =
+				exceptionCode == 3221225477u &&
+				TryCaptureFaultInstructionWindow(rip, faultInstructionBytes);
+
 			switch (exceptionCode)
 			{
 				case 3221225477u:
 					LogAccessViolationTrace(exceptionAddress, exceptionRecord);
+					if (capturedFaultInstruction)
+					{
+						Console.Error.WriteLine(
+							$"[LOADER][TRACE] VEH_AV instruction @0x{rip:X16}: {Convert.ToHexString(faultInstructionBytes)}");
+						Console.Error.Flush();
+					}
 					break;
 				case 3221226505u:
 					{
@@ -1149,6 +1160,36 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
+	}
+
+	internal unsafe static bool TryCaptureFaultInstructionWindow(ulong address, Span<byte> destination)
+	{
+		if (address < 65536 || destination.IsEmpty || ulong.MaxValue - address < (ulong)destination.Length)
+		{
+			return false;
+		}
+
+		var end = address + (ulong)destination.Length;
+		for (var cursor = address; cursor < end;)
+		{
+			if (VirtualQuery((void*)cursor, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+				mbi.State != MEM_COMMIT ||
+				!IsReadableProtection(mbi.Protect))
+			{
+				return false;
+			}
+
+			var regionEnd = mbi.BaseAddress + mbi.RegionSize;
+			if (regionEnd <= cursor)
+			{
+				return false;
+			}
+
+			cursor = Math.Min(regionEnd, end);
+		}
+
+		new ReadOnlySpan<byte>((void*)address, destination.Length).CopyTo(destination);
+		return true;
 	}
 
 	private string FormatPointerWithNearestSymbol(ulong value)
