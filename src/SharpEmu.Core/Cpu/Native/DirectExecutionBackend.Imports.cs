@@ -161,6 +161,7 @@ public sealed partial class DirectExecutionBackend
 			return 18446744071562199042uL;
 		}
 		ImportStubEntry importStubEntry = _importEntries[importIndex];
+		using var activeImport = EnterActiveImport(importStubEntry.Nid);
 		if (_perfHleHistogram)
 		{
 			RecordPerfHleCall(importStubEntry.Export?.Name ?? importStubEntry.Nid);

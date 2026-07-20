@@ -292,6 +292,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private const int ImportDispatchBlockSize = 256;
 
+	// Slow host address-space operations can exceed one watchdog interval, but
+	// an HLE export that never returns must still terminate within a fixed bound.
+	private const int ActiveImportWatchdogGraceIntervals = 4;
+
 	private KeyValuePair<string, ulong>[] _runtimeSymbolsByAddress = Array.Empty<KeyValuePair<string, ulong>>();
 
 	private readonly Dictionary<string, ulong> _runtimeSymbolsByName = new Dictionary<string, ulong>(StringComparer.Ordinal);
@@ -737,6 +741,12 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private long _lastProgressTimestamp;
 
+	private int _activeImportDispatchCount;
+
+	private long _activeImportStartTimestamp;
+
+	private string? _activeImportNid;
+
 	private int _stallWatchdogTriggered;
 
 	private volatile bool _stallWatchdogStop;
@@ -1160,6 +1170,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		ClearGuestThreads();
 		_contextualUnresolvedReturnSites.Clear();
+		_activeImportDispatchCount = 0;
+		_activeImportStartTimestamp = 0;
+		_activeImportNid = null;
 		_stallWatchdogTriggered = 0;
 		_stallWatchdogStop = false;
 		_readyDispatchStop = false;
@@ -5720,6 +5733,46 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		Volatile.Write(ref _lastProgressTimestamp, Stopwatch.GetTimestamp());
 	}
 
+	private ActiveImportScope EnterActiveImport(string nid)
+	{
+		Volatile.Write(ref _activeImportNid, nid);
+		Volatile.Write(ref _activeImportStartTimestamp, Stopwatch.GetTimestamp());
+		Interlocked.Increment(ref _activeImportDispatchCount);
+		return new ActiveImportScope(this);
+	}
+
+	private readonly struct ActiveImportScope : IDisposable
+	{
+		private readonly DirectExecutionBackend _owner;
+
+		public ActiveImportScope(DirectExecutionBackend owner)
+		{
+			_owner = owner;
+		}
+
+		public void Dispose()
+		{
+			Interlocked.Decrement(ref _owner._activeImportDispatchCount);
+		}
+	}
+
+	internal static bool IsActiveImportWithinWatchdogGrace(
+		int activeImportCount,
+		long activeImportStartTimestamp,
+		long currentTimestamp,
+		long graceTicks)
+	{
+		if (activeImportCount <= 0 ||
+			activeImportStartTimestamp <= 0 ||
+			graceTicks <= 0)
+		{
+			return false;
+		}
+
+		var elapsed = currentTimestamp - activeImportStartTimestamp;
+		return elapsed >= 0 && elapsed < graceTicks;
+	}
+
 	private static int GetStallWatchdogSeconds()
 	{
 		if (int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_STALL_WATCHDOG_SECONDS"), out var result))
@@ -5759,6 +5812,9 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		dispatcherThread.Start();
 
 		long num = (long)((double)stallWatchdogSeconds * Stopwatch.Frequency);
+		long activeImportGraceTicks = num > long.MaxValue / ActiveImportWatchdogGraceIntervals
+			? long.MaxValue
+			: num * ActiveImportWatchdogGraceIntervals;
 		int periodicSnapshotSeconds =
 			int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_PERIODIC_SNAPSHOT_SECONDS"), out var pss)
 				? Math.Max(0, pss)
@@ -5796,6 +5852,29 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					MarkExecutionProgress();
 					continue;
 				}
+				var activeImportCount = Volatile.Read(ref _activeImportDispatchCount);
+				var activeImportStart = Volatile.Read(ref _activeImportStartTimestamp);
+				var watchdogTimestamp = Stopwatch.GetTimestamp();
+				var activeNid = Volatile.Read(ref _activeImportNid) ?? "unknown";
+				var activeName = _moduleManager.TryGetExport(activeNid, out var activeExport)
+					? $"{activeExport.LibraryName}:{activeExport.Name}"
+					: activeNid;
+				var activeElapsedTicks = watchdogTimestamp - activeImportStart;
+				if (IsActiveImportWithinWatchdogGrace(
+						activeImportCount,
+						activeImportStart,
+						watchdogTimestamp,
+						activeImportGraceTicks))
+				{
+					var activeSeconds = activeElapsedTicks / (double)Stopwatch.Frequency;
+					Console.Error.WriteLine(
+						$"[LOADER][WARN] No import completion for {stallWatchdogSeconds}s while {activeName} is still executing " +
+						$"({activeSeconds:F1}s elapsed, active={activeImportCount}); continuing within bounded grace period.");
+					LogStallWatchdogSnapshot();
+					Console.Error.Flush();
+					MarkExecutionProgress();
+					continue;
+				}
 				if (IsExpectedBlockingImportStall(out var blockingNid, out var blockingName))
 				{
 					Console.Error.WriteLine(
@@ -5809,7 +5888,11 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				{
 					continue;
 				}
-				LastError = $"Execution stalled with no import progress for {stallWatchdogSeconds}s (imports={Volatile.Read(ref _importDispatchCount)}).";
+				LastError = activeImportCount > 0 && activeElapsedTicks >= activeImportGraceTicks
+					? $"HLE import {activeName} exceeded the bounded watchdog grace period " +
+						$"({activeElapsedTicks / (double)Stopwatch.Frequency:F1}s, active={activeImportCount})."
+					: $"Execution stalled with no import progress for {stallWatchdogSeconds}s " +
+						$"(imports={Volatile.Read(ref _importDispatchCount)}).";
 				Console.Error.WriteLine("[LOADER][ERROR] " + LastError);
 				LogStallWatchdogSnapshot();
 				Console.Error.Flush();
