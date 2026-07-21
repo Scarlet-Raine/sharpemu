@@ -28,5 +28,11 @@ public interface IGuestAddressSpace : IGuestMemoryAllocator
 
     bool TryAllocateAtOrAbove(ulong desiredAddress, ulong size, bool executable, ulong alignment, out ulong actualAddress);
 
+    /// <summary>
+    /// Commits host backing for an already reserved guest range before native
+    /// guest code accesses it directly.
+    /// </summary>
+    bool TryCommit(ulong address, ulong size);
+
     bool TryProtect(ulong address, ulong size, GuestPageProtection protection);
 }

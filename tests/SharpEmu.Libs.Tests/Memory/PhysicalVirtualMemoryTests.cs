@@ -14,6 +14,24 @@ namespace SharpEmu.Libs.Tests.Memory;
 // These tests pin that behaviour through fake IHostMemory implementations.
 public sealed class PhysicalVirtualMemoryTests
 {
+    [Fact]
+    public void TryCommit_ReservedRange_CommitsRequestedPages()
+    {
+        using var host = new LazyZeroedHostMemory();
+        using var memory = new PhysicalVirtualMemory(host);
+        var address = memory.AllocateAt(0, 5UL << 30, executable: false);
+        host.CommitCalls.Clear();
+
+        Assert.True(memory.TryCommit(address + 0x2000, 0x3000));
+        Assert.Equal(
+            [
+                (address + 0x2000, 0x1000UL, HostPageProtection.ReadWrite),
+                (address + 0x3000, 0x1000UL, HostPageProtection.ReadWrite),
+                (address + 0x4000, 0x1000UL, HostPageProtection.ReadWrite),
+            ],
+            host.CommitCalls);
+    }
+
     // 1. Lazy commit: a reserve-only region has its pages committed on demand
     //    when read; freshly committed pages read as zero.
     [Fact]

@@ -751,6 +751,25 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         return _hostMemory.Protect(address, size, ResolveProtection(protection), out _);
     }
 
+    public bool TryCommit(ulong address, ulong size)
+    {
+        if (size == 0 || address > ulong.MaxValue - size)
+        {
+            return false;
+        }
+
+        _gate.EnterReadLock();
+        try
+        {
+            var region = FindRegion(address, size);
+            return region != null && EnsureRangeCommitted(address, size, region);
+        }
+        finally
+        {
+            _gate.ExitReadLock();
+        }
+    }
+
     // Reproduces the decomposition KernelMemoryCompatExports.ResolveHostProtection
     // performed before this seam existed; the Windows backend maps each case back
     // to the identical PAGE_* value.
