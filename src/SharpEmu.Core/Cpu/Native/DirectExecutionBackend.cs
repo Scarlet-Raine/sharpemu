@@ -2418,6 +2418,31 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 		byte* code = (byte*)ptr;
 		int offset = 0;
+		// The CLR can raise these while its thread is in cooperative GC mode. Calling
+		// managed code from the VEH then fail-fasts at the reverse-P/Invoke boundary;
+		// none represent guest faults, so leave them to their owning runtime.
+		ReadOnlySpan<uint> passThroughExceptionCodes =
+			[Windows.WindowsFaultCodes.ClrManagedException, 0xE06D7363u,
+			 Windows.WindowsFaultCodes.FastFail, Windows.WindowsFaultCodes.StackOverflow];
+		EmitByte(code, ref offset, 0x48); EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x01); // mov rax, [rcx]
+		EmitByte(code, ref offset, 0x8B); EmitByte(code, ref offset, 0x00); // mov eax, [rax]
+		var passJumpOffsets = stackalloc int[passThroughExceptionCodes.Length];
+		for (int i = 0; i < passThroughExceptionCodes.Length; i++)
+		{
+			EmitByte(code, ref offset, 0x3D); // cmp eax, imm32
+			EmitUInt32(code, ref offset, passThroughExceptionCodes[i]);
+			EmitByte(code, ref offset, 0x74); // je pass
+			passJumpOffsets[i] = offset;
+			EmitByte(code, ref offset, 0x00);
+		}
+		EmitByte(code, ref offset, 0xEB); EmitByte(code, ref offset, 0x03); // jmp over pass block
+		int nativePassOffset = offset;
+		EmitByte(code, ref offset, 0x31); EmitByte(code, ref offset, 0xC0); // xor eax, eax
+		EmitByte(code, ref offset, 0xC3); // ret
+		for (int i = 0; i < passThroughExceptionCodes.Length; i++)
+		{
+			code[passJumpOffsets[i]] = checked((byte)(nativePassOffset - (passJumpOffsets[i] + 1)));
+		}
 		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x54); // push r12
 		EmitByte(code, ref offset, 0x41); EmitByte(code, ref offset, 0x55); // push r13
 		EmitByte(code, ref offset, 0x49); EmitByte(code, ref offset, 0x89); EmitByte(code, ref offset, 0xE4); // mov r12, rsp
