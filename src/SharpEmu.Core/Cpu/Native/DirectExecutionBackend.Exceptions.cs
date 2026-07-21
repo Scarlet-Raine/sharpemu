@@ -151,6 +151,8 @@ public sealed partial class DirectExecutionBackend
 			{
 				case 3221225477u:
 					LogAccessViolationTrace(exceptionAddress, exceptionRecord);
+					DumpRecentImportTrace();
+					DumpGuestDisasmDiagnostics(rip, ReadCtxU64(contextRecord, 160), rsp);
 					break;
 				case 3221226505u:
 					{
@@ -391,8 +393,6 @@ public sealed partial class DirectExecutionBackend
 					{
 						Console.Error.WriteLine("[LOADER][ERROR]   Could not read code at RIP");
 					}
-					DumpRecentImportTrace();
-					DumpGuestDisasmDiagnostics(rip, rbp, rsp);
 					DumpGuestRegisterWindowDiagnostics(
 						rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp,
 						r8, r9, r10, r11, r12, r13, r14, r15);
@@ -623,61 +623,52 @@ public sealed partial class DirectExecutionBackend
 			DumpGuestInstructionStream("fault-prelude", rip - 0x20, 24);
 		}
 
+		var extraAddresses = Environment.GetEnvironmentVariable("SHARPEMU_LOG_DISASM_ADDRS");
+		if (!string.IsNullOrWhiteSpace(extraAddresses))
+		{
+			foreach (var token in extraAddresses.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+			{
+				var normalized = token.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+					? token[2..]
+					: token;
+				if (!ulong.TryParse(normalized, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var address) || address < 0x20)
+				{
+					continue;
+				}
+
+				DumpGuestInstructionStream($"extra-0x{address:X16}", address, 48);
+			}
+		}
+
 		// Optimized guest code frequently omits frame pointers. The return
 		// address at RSP is then more useful than an RBP walk and identifies the
 		// exact call site that supplied the faulting arguments.
-		if (TryReadHostQword(rsp, out var stackReturn) && stackReturn >= 0x60)
+		if (TryReadHostQword(rsp, out var stackReturn) && IsLikelyReturnAddress(stackReturn))
 		{
 			DumpGuestInstructionStream("stack-return-prelude", stackReturn - 0x60, 40);
 		}
 
-		try
+		ulong frame = rbp;
+		for (int i = 0; i < 3; i++)
 		{
-			ulong frame = rbp;
-			for (int i = 0; i < 3; i++)
+			if (frame < 0x10000 ||
+				!TryReadHostQword(frame + sizeof(ulong), out var ret) ||
+				!TryReadHostQword(frame, out var next))
 			{
-				if (frame < 0x10000)
-				{
-					break;
-				}
-
-				ulong ret = (ulong)Marshal.ReadInt64((nint)(frame + 8));
-				if (ret >= 0x40)
-				{
-					DumpGuestInstructionStream($"frame#{i}-ret-prelude", ret - 0x40, 24);
-				}
-
-				ulong next = (ulong)Marshal.ReadInt64((nint)frame);
-				if (next <= frame)
-				{
-					break;
-				}
-
-				frame = next;
-			}
-		}
-		catch
-		{
-			Console.Error.WriteLine("[LOADER][WARNING]   Could not dump disasm diagnostics.");
-		}
-
-		var extraAddresses = Environment.GetEnvironmentVariable("SHARPEMU_LOG_DISASM_ADDRS");
-		if (string.IsNullOrWhiteSpace(extraAddresses))
-		{
-			return;
-		}
-
-		foreach (var token in extraAddresses.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-		{
-			var normalized = token.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
-				? token[2..]
-				: token;
-			if (!ulong.TryParse(normalized, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var address) || address < 0x20)
-			{
-				continue;
+				break;
 			}
 
-			DumpGuestInstructionStream($"extra-0x{address:X16}", address, 48);
+			if (IsLikelyReturnAddress(ret))
+			{
+				DumpGuestInstructionStream($"frame#{i}-ret-prelude", ret - 0x40, 24);
+			}
+
+			if (next <= frame)
+			{
+				break;
+			}
+
+			frame = next;
 		}
 	}
 
