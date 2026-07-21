@@ -31,9 +31,15 @@ packages/
 *.nupkg
 .nuget/
 .dotnet-home/
+.dotnet-cli/
+.nuget-packages/
 .cache/
 __pycache__/
 *.py[cod]
+
+# Local coordination and legally owned game dumps. Never commit these.
+AGENTS.md
+games/
 
 .DS_Store
 Thumbs.db
