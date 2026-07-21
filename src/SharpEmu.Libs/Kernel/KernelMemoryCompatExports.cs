@@ -3149,6 +3149,16 @@ public static partial class KernelMemoryCompatExports
                 DirectStart: directMemoryStart));
         }
 
+        if (KernelVirtualRangeAllocator.TryResolveAddressSpace(ctx.Memory, out var addressSpace) &&
+            !addressSpace.TryCommit(mappedAddress, length))
+        {
+            lock (_memoryGate)
+            {
+                _mappedRegions.Remove(mappedAddress);
+            }
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
@@ -3239,6 +3249,19 @@ public static partial class KernelMemoryCompatExports
                 IsFlexible: true,
                 IsDirect: false,
                 DirectStart: 0));
+        }
+
+        if (KernelVirtualRangeAllocator.TryResolveAddressSpace(ctx.Memory, out var addressSpace) &&
+            !addressSpace.TryCommit(mappedAddress, length))
+        {
+            lock (_memoryGate)
+            {
+                _mappedRegions.Remove(mappedAddress);
+                _allocatedFlexibleBytes = _allocatedFlexibleBytes >= length
+                    ? _allocatedFlexibleBytes - length
+                    : 0;
+            }
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
