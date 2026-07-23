@@ -38,7 +38,7 @@ public sealed partial class DirectExecutionBackend
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
 	private int _il2CppExceptionDiagnosticCount;
 
-	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
+	private static unsafe ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
 		try
 		{
@@ -46,6 +46,7 @@ public sealed partial class DirectExecutionBackend
 			{
 				Console.Error.WriteLine(
 					$"[LOADER][ERROR] ImportDispatchGatewayManaged: invalid backend handle 0x{backendHandle:X16}");
+				*(ulong*)(argPackPtr + ImportSavedRaxOffset) = 18446744071562199042uL;
 				return 18446744071562199042uL;
 			}
 
@@ -63,6 +64,10 @@ public sealed partial class DirectExecutionBackend
 		{
 			Console.Error.WriteLine(
 				$"[LOADER][ERROR] ImportDispatchGatewayManaged exception: {ex.GetType().Name}: {ex.Message}");
+			// Write the error code to the save area so the trampoline can restore
+			// it into guest RAX.  Without this, the guest would see stale pre-call
+			// RAX instead of the error indication.
+			*(ulong*)(argPackPtr + ImportSavedRaxOffset) = 18446744071562199298uL;
 			return 18446744071562199298uL;
 		}
 	}
@@ -162,11 +167,13 @@ public sealed partial class DirectExecutionBackend
 		if (cpuContext == null)
 		{
 			LastError = "Import dispatch called without active CPU context";
+			*(ulong*)(argPackPtr + ImportSavedRaxOffset) = 18446744071562199298uL;
 			return 18446744071562199298uL;
 		}
 		if ((uint)importIndex >= (uint)_importEntries.Length)
 		{
 			LastError = $"Import dispatch index out of range: {importIndex}";
+			*(ulong*)(argPackPtr + ImportSavedRaxOffset) = 18446744071562199042uL;
 			return 18446744071562199042uL;
 		}
 		ImportStubEntry importStubEntry = _importEntries[importIndex];
@@ -183,6 +190,7 @@ public sealed partial class DirectExecutionBackend
 		if (importStubEntry.IsLeaf &&
 			TryDispatchLeafImport(cpuContext, importStubEntry, argPackPtr, num, out var leafResult))
 		{
+			*(ulong*)(argPackPtr + ImportSavedRaxOffset) = leafResult;
 			return leafResult;
 		}
 
@@ -273,6 +281,7 @@ public sealed partial class DirectExecutionBackend
 				Console.Error.WriteLine(
 					$"[LOADER][WARN] Recovered guest stack-check epilogue " +
 					$"ret=0x{num7:X16} -> 0x{recoveredReturn:X16}");
+				*(ulong*)(argPackPtr + ImportSavedRaxOffset) = 0;
 				return 0;
 			}
 		}
@@ -302,9 +311,10 @@ public sealed partial class DirectExecutionBackend
 			TrackDistinctImportNid(importStubEntry.Nid);
 			TrackStrlenPrelude(importStubEntry.Nid, num, num7);
 		}
-		if (!string.IsNullOrWhiteSpace(_probeImportReturn) &&
-			(string.Equals(_probeImportReturn, "*", StringComparison.Ordinal) ||
-			 string.Equals(_probeImportReturn, importStubEntry.Nid, StringComparison.Ordinal)) &&
+		if (((_probeImportReturnAddress != 0 && num7 == _probeImportReturnAddress) ||
+			 (!string.IsNullOrWhiteSpace(_probeImportReturn) &&
+			  (string.Equals(_probeImportReturn, "*", StringComparison.Ordinal) ||
+			   string.Equals(_probeImportReturn, importStubEntry.Nid, StringComparison.Ordinal)))) &&
 			Interlocked.Increment(ref _probeImportReturnAddressCount) <= 8)
 		{
 			ProbeReturnRip(num7, num);
@@ -333,6 +343,7 @@ public sealed partial class DirectExecutionBackend
 			if (TryForceGuestExitToHostStub(argPackPtr, num, num7, importStubEntry.Nid))
 			{
 				cpuContext[CpuRegister.Rax] = 1uL;
+				*(ulong*)(argPackPtr + ImportSavedRaxOffset) = 1uL;
 				return 1uL;
 			}
 		}
@@ -545,6 +556,7 @@ public sealed partial class DirectExecutionBackend
 					cpuContext,
 					CaptureImportBoundaryContinuation(cpuContext, argPackPtr, num7));
 			}
+			ArmGuestRipSampler(num7);
 			StoreImportVectorReturn(cpuContext, argPackPtr);
 			if (dispatchResolved &&
 				orbisGen2Result == OrbisGen2Result.ORBIS_GEN2_OK &&
@@ -611,6 +623,7 @@ public sealed partial class DirectExecutionBackend
 					LastError = transferError ?? "failed to prepare guest context transfer";
 					ActiveForcedGuestExit = true;
 					cpuContext[CpuRegister.Rax] = 18446744071562199298uL;
+					*(ulong*)(argPackPtr + ImportSavedRaxOffset) = cpuContext[CpuRegister.Rax];
 					return cpuContext[CpuRegister.Rax];
 				}
 
@@ -628,6 +641,7 @@ public sealed partial class DirectExecutionBackend
 					Volatile.Write(ref transferGuestThreadState.LastImportRax, transferTarget.Rax);
 					Volatile.Write(ref transferGuestThreadState.LastImportResultValid, 1);
 				}
+				*(ulong*)(argPackPtr + ImportSavedRaxOffset) = unchecked((ulong)transferFrame);
 				return unchecked((ulong)transferFrame);
 			}
 			if (GuestThreadExecution.TryConsumeCurrentEntryExit(out var exitValue, out var exitReason))
@@ -695,6 +709,7 @@ public sealed partial class DirectExecutionBackend
 				Volatile.Write(ref completedGuestThreadState.LastImportRax, guestReturnValue);
 				Volatile.Write(ref completedGuestThreadState.LastImportResultValid, 1);
 			}
+			*(ulong*)(argPackPtr + ImportSavedRaxOffset) = guestReturnValue;
 			return guestReturnValue;
 		}
 		catch (Exception ex)
@@ -708,6 +723,7 @@ public sealed partial class DirectExecutionBackend
 				Volatile.Write(ref failedGuestThreadState.LastImportRax, cpuContext[CpuRegister.Rax]);
 				Volatile.Write(ref failedGuestThreadState.LastImportResultValid, 1);
 			}
+			*(ulong*)(argPackPtr + ImportSavedRaxOffset) = cpuContext[CpuRegister.Rax];
 			return cpuContext[CpuRegister.Rax];
 		}
 	}
@@ -1279,6 +1295,17 @@ public sealed partial class DirectExecutionBackend
 		cpuContext[CpuRegister.R14] = *(ulong*)(argPackPtr + 80);
 		cpuContext[CpuRegister.R15] = *(ulong*)(argPackPtr + 88);
 		cpuContext[CpuRegister.Rsp] = (ulong)argPackPtr + 96uL;
+		var traceImportReturn = (_probeImportReturnAddress != 0 && returnRip == _probeImportReturnAddress) ||
+			(!string.IsNullOrWhiteSpace(_probeImportReturn) &&
+			 (string.Equals(_probeImportReturn, "*", StringComparison.Ordinal) ||
+			  string.Equals(_probeImportReturn, importStubEntry.Nid, StringComparison.Ordinal)));
+		var captureImportReturn = traceImportReturn &&
+			Interlocked.Increment(ref _probeImportReturnAddressCount) <= 8;
+		if (captureImportReturn)
+		{
+			ProbeReturnRip(returnRip, dispatchIndex);
+			TraceImportReturnSnapshot("before", importStubEntry.Nid, dispatchIndex, cpuContext);
+		}
 
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
@@ -1344,6 +1371,11 @@ public sealed partial class DirectExecutionBackend
 				cpuContext,
 				CaptureImportBoundaryContinuation(cpuContext, argPackPtr, returnRip));
 		}
+		if (captureImportReturn)
+		{
+			TraceImportReturnSnapshot("after", importStubEntry.Nid, dispatchIndex, cpuContext);
+		}
+		ArmGuestRipSampler(returnRip);
 		StoreImportVectorReturn(cpuContext, argPackPtr);
 
 		if (returnValue != (int)OrbisGen2Result.ORBIS_GEN2_OK)

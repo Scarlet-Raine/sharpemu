@@ -279,6 +279,44 @@ public sealed partial class DirectExecutionBackend
 					Console.Error.WriteLine(
 						$"[LOADER][TRACE]   0x{instruction.Rip:X16}: {instruction.Text} " +
 						$"bytes={IcedDecoder.FormatBytes(instruction.Bytes)}");
+					if (instruction.Bytes.Length == 5 && instruction.Bytes[0] == 0xE8)
+					{
+						var displacement = BitConverter.ToInt32(instruction.Bytes, 1);
+						var target = unchecked((ulong)((long)instruction.Rip + instruction.Bytes.Length + displacement));
+						if (IcedDecoder.TryReadGuestBytes(cpuContext.Memory, target, 32, out var directTargetBytes) &&
+							IcedDecoder.TryDecode(target, directTargetBytes, out var targetInstruction))
+						{
+							Console.Error.WriteLine(
+								$"[LOADER][TRACE]     call target 0x{target:X16}: {targetInstruction.Text} " +
+								$"bytes={IcedDecoder.FormatBytes(targetInstruction.Bytes)}");
+							if (targetInstruction.Bytes.Length == 6 && targetInstruction.Bytes[0] == 0xFF &&
+								targetInstruction.Bytes[1] == 0x25)
+							{
+								var slotDisplacement = BitConverter.ToInt32(targetInstruction.Bytes, 2);
+								var slot = unchecked((ulong)((long)target + 6 + slotDisplacement));
+								if (cpuContext.TryReadUInt64(slot, out var slotValue))
+								{
+									Console.Error.WriteLine(
+										$"[LOADER][TRACE]       thunk slot 0x{slot:X16} -> 0x{slotValue:X16}");
+									for (int importIndex = 0; importIndex < _importEntries.Length; importIndex++)
+									{
+										if (_importEntries[importIndex].Address != slotValue)
+										{
+											continue;
+										}
+
+										var nid = _importEntries[importIndex].Nid;
+										var exportName = _moduleManager.TryGetExport(nid, out var export)
+											? $"{export.LibraryName}:{export.Name}"
+											: "unresolved";
+										Console.Error.WriteLine(
+											$"[LOADER][TRACE]       thunk import: {exportName} ({nid})");
+										break;
+									}
+								}
+							}
+						}
+					}
 				}
 			}
 		}
@@ -391,6 +429,186 @@ public sealed partial class DirectExecutionBackend
 					}
 				}
 			}
+		}
+	}
+
+	private void TraceImportReturnSnapshot(
+		string phase,
+		string nid,
+		long dispatchIndex,
+		CpuContext cpuContext)
+	{
+		var metadata = cpuContext[CpuRegister.R14];
+		Console.Error.WriteLine(
+			$"[LOADER][TRACE] import-return {phase}: #{dispatchIndex} nid={nid} " +
+			$"rax=0x{cpuContext[CpuRegister.Rax]:X16} r12=0x{cpuContext[CpuRegister.R12]:X16} " +
+			$"r13=0x{cpuContext[CpuRegister.R13]:X16} r14=0x{metadata:X16} " +
+			$"r15=0x{cpuContext[CpuRegister.R15]:X16}");
+		if (metadata < 0x10000)
+		{
+			return;
+		}
+
+		Span<byte> window = stackalloc byte[64];
+		if (cpuContext.Memory.TryRead(metadata, window))
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] import-return {phase}: metadata[0x{metadata:X16}]=" +
+				BitConverter.ToString(window.ToArray()).Replace("-", " "));
+		}
+	}
+
+	private void ConfigureGuestRipSampler()
+	{
+		StopGuestRipSampler();
+		var armReturnRip = ParseOptionalHexAddress(
+			Environment.GetEnvironmentVariable("SHARPEMU_SAMPLE_GUEST_AFTER_IMPORT_RET"));
+		if (armReturnRip == 0)
+		{
+			return;
+		}
+
+		if (!OperatingSystem.IsWindows())
+		{
+			Console.Error.WriteLine(
+				"[LOADER][WARN] Guest RIP sampling requires Windows thread-context capture.");
+			return;
+		}
+
+		var minimumRip = ParseOptionalHexAddress(
+			Environment.GetEnvironmentVariable("SHARPEMU_SAMPLE_GUEST_RIP_MIN"));
+		var maximumRip = ParseOptionalHexAddress(
+			Environment.GetEnvironmentVariable("SHARPEMU_SAMPLE_GUEST_RIP_MAX"));
+		minimumRip = minimumRip == 0 ? 0x0000000800000000UL : minimumRip;
+		maximumRip = maximumRip == 0 ? 0x0000001000000000UL : maximumRip;
+		if (maximumRip <= minimumRip)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][WARN] Guest RIP sampling range is invalid: 0x{minimumRip:X16}-0x{maximumRip:X16}");
+			return;
+		}
+
+		var maximumSamples = ParsePositiveInt(
+			Environment.GetEnvironmentVariable("SHARPEMU_SAMPLE_GUEST_MAX_SNAPSHOTS"),
+			64,
+			512);
+		_guestRipSampler = new GuestRipSampler(this, armReturnRip, minimumRip, maximumRip, maximumSamples);
+		Console.Error.WriteLine(
+			$"[LOADER][TRACE] guest-rip-sampler configured: after_ret=0x{armReturnRip:X16} " +
+			$"range=0x{minimumRip:X16}-0x{maximumRip:X16} max={maximumSamples}");
+	}
+
+	private void ArmGuestRipSampler(ulong returnRip)
+	{
+		_guestRipSampler?.Arm(returnRip, GetCurrentThreadId());
+	}
+
+	private void StopGuestRipSampler()
+	{
+		var sampler = Interlocked.Exchange(ref _guestRipSampler, null);
+		sampler?.Dispose();
+	}
+
+	private static int ParsePositiveInt(string? value, int fallback, int maximum)
+	{
+		return int.TryParse(value, out var parsed) && parsed > 0
+			? Math.Min(parsed, maximum)
+			: fallback;
+	}
+
+	/// <summary>
+	/// Captures a bounded series of worker-thread contexts after a selected HLE
+	/// return. The sampler only reads contexts; it never changes debug registers,
+	/// instruction bytes, or the resumed context.
+	/// </summary>
+	private sealed class GuestRipSampler : IDisposable
+	{
+		private readonly DirectExecutionBackend _backend;
+		private readonly ulong _armReturnRip;
+		private readonly ulong _minimumRip;
+		private readonly ulong _maximumRip;
+		private readonly int _maximumSamples;
+		private readonly AutoResetEvent _armed = new(false);
+		private readonly Thread _thread;
+		private int _hostThreadId;
+		private int _armedOnce;
+		private volatile bool _stopping;
+
+		public GuestRipSampler(
+			DirectExecutionBackend backend,
+			ulong armReturnRip,
+			ulong minimumRip,
+			ulong maximumRip,
+			int maximumSamples)
+		{
+			_backend = backend;
+			_armReturnRip = armReturnRip;
+			_minimumRip = minimumRip;
+			_maximumRip = maximumRip;
+			_maximumSamples = maximumSamples;
+			_thread = new Thread(ThreadMain)
+			{
+				IsBackground = true,
+				Name = "GuestRipSampler",
+			};
+			_thread.Start();
+		}
+
+		public void Arm(ulong returnRip, uint hostThreadId)
+		{
+			if (returnRip != _armReturnRip ||
+				Interlocked.CompareExchange(ref _armedOnce, 1, 0) != 0)
+			{
+				return;
+			}
+
+			Volatile.Write(ref _hostThreadId, unchecked((int)hostThreadId));
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] guest-rip-sampler armed: ret=0x{returnRip:X16} host_tid={hostThreadId}");
+			_armed.Set();
+		}
+
+		private void ThreadMain()
+		{
+			_armed.WaitOne();
+			if (_stopping)
+			{
+				return;
+			}
+
+			var hostThreadId = Volatile.Read(ref _hostThreadId);
+			var maximumAttempts = Math.Max(_maximumSamples * 128, 1024);
+			var captured = 0;
+			var attempts = 0;
+			while (!_stopping && captured < _maximumSamples && attempts++ < maximumAttempts)
+			{
+				if (TryCaptureHostThreadContext(hostThreadId, out var snapshot) &&
+					snapshot.Rip >= _minimumRip && snapshot.Rip < _maximumRip)
+				{
+					captured++;
+					Console.Error.WriteLine(
+						$"[LOADER][TRACE] guest-rip-sample #{captured}: rip=0x{snapshot.Rip:X16} " +
+						$"rsp=0x{snapshot.Rsp:X16} rbp=0x{snapshot.Rbp:X16} " +
+						$"rax=0x{snapshot.Rax:X16} rdi=0x{snapshot.Rdi:X16} " +
+						$"r12=0x{snapshot.R12:X16} r14=0x{snapshot.R14:X16}");
+				}
+
+				Thread.SpinWait(128);
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] guest-rip-sampler complete: samples={captured} attempts={attempts}");
+		}
+
+		public void Dispose()
+		{
+			_stopping = true;
+			_armed.Set();
+			if (!ReferenceEquals(Thread.CurrentThread, _thread))
+			{
+				_thread.Join(500);
+			}
+			_armed.Dispose();
 		}
 	}
 

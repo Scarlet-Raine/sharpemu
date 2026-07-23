@@ -395,6 +395,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private long _probeImportReturnAddressCount;
 
+	private GuestRipSampler? _guestRipSampler;
+
 	private string? _importFilter;
 
 	private bool _disableImportLoopGuard;
@@ -916,7 +918,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		ulong Rax,
 		ulong Rbx,
 		ulong Rcx,
-		ulong Rdx);
+		ulong Rdx,
+		ulong Rdi,
+		ulong R12,
+		ulong R14);
 
 	public string BackendName => "native-backend";
 
@@ -1213,6 +1218,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_probeImportReturnAddress = ParseOptionalHexAddress(
 			Environment.GetEnvironmentVariable("SHARPEMU_PROBE_IMPORT_RET_ADDRESS"));
 		_probeImportReturnAddressCount = 0;
+		ConfigureGuestRipSampler();
 		_importFilter = Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FILTER");
 		_disableImportLoopGuard = string.Equals(
 			Environment.GetEnvironmentVariable("SHARPEMU_DISABLE_IMPORT_LOOP_GUARD"),
@@ -1269,6 +1275,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 		finally
 		{
+			StopGuestRipSampler();
 			HostSessionControl.SetShutdownHandler(null);
 			DrainDeferredBootstrapTraces();
 			GuestThreadExecution.Scheduler = previousGuestThreadScheduler;
@@ -2275,24 +2282,24 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			ptr2[num++] = 76;
 			ptr2[num++] = 137;
 			ptr2[num++] = 228;
-			ptr2[num++] = 95;
-			ptr2[num++] = 94;
-			ptr2[num++] = 90;
-			ptr2[num++] = 89;
-			ptr2[num++] = 65;
-			ptr2[num++] = 88;
-			ptr2[num++] = 65;
-			ptr2[num++] = 89;
-			ptr2[num++] = 91;
-			ptr2[num++] = 93;
-			ptr2[num++] = 65;
-			ptr2[num++] = 92;
-			ptr2[num++] = 65;
-			ptr2[num++] = 93;
-			ptr2[num++] = 65;
-			ptr2[num++] = 94;
-			ptr2[num++] = 65;
-			ptr2[num++] = 95;
+			// Restore RAX with the HLE return value written by the managed
+			// gateway to the volatile save area.  R12 still holds argPackPtr
+			// and must be loaded before the GPR pops restore guest R12.
+			ptr2[num++] = 0x48; ptr2[num++] = 0x8B; ptr2[num++] = 0x84; ptr2[num++] = 0x24; // mov rax,[r12-176]
+			*(int*)(ptr2 + num) = ImportSavedRaxOffset; num += 4;
+			// Pop GPRs in correct LIFO order (reverse of push: R15..RDI).
+			ptr2[num++] = 95;              // pop rdi
+			ptr2[num++] = 94;              // pop rsi
+			ptr2[num++] = 90;              // pop rdx
+			ptr2[num++] = 89;              // pop rcx
+			ptr2[num++] = 65; ptr2[num++] = 88; // pop r8
+			ptr2[num++] = 65; ptr2[num++] = 89; // pop r9
+			ptr2[num++] = 91;              // pop rbx
+			ptr2[num++] = 93;              // pop rbp
+			ptr2[num++] = 65; ptr2[num++] = 92; // pop r12
+			ptr2[num++] = 65; ptr2[num++] = 93; // pop r13
+			ptr2[num++] = 65; ptr2[num++] = 94; // pop r14
+			ptr2[num++] = 65; ptr2[num++] = 95; // pop r15
 			ptr2[num++] = 195;
 			Debug.Assert(num <= 512, "Import handler trampoline exceeded its allocation.");
 			uint num2 = default(uint);
@@ -6832,13 +6839,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 			snapshot = new HostThreadContextSnapshot(
 				true,
-				ReadCtxU64(contextRecord, 248),
-				ReadCtxU64(contextRecord, 152),
-				ReadCtxU64(contextRecord, 160),
-				ReadCtxU64(contextRecord, 120),
-				ReadCtxU64(contextRecord, 144),
-				ReadCtxU64(contextRecord, 128),
-				ReadCtxU64(contextRecord, 136));
+				ReadCtxU64(contextRecord, CTX_RIP),
+				ReadCtxU64(contextRecord, CTX_RSP),
+				ReadCtxU64(contextRecord, CTX_RBP),
+				ReadCtxU64(contextRecord, CTX_RAX),
+				ReadCtxU64(contextRecord, CTX_RBX),
+				ReadCtxU64(contextRecord, CTX_RCX),
+				ReadCtxU64(contextRecord, CTX_RDX),
+				ReadCtxU64(contextRecord, CTX_RDI),
+				ReadCtxU64(contextRecord, CTX_R12),
+				ReadCtxU64(contextRecord, CTX_R14));
 			return true;
 		}
 		finally
@@ -7007,6 +7017,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		// still reachable from a worker inside guest code, so drain the
 		// scheduler first and leak the session rather than fault a straggler.
 		_forcedGuestExit = true;
+		StopGuestRipSampler();
 		StopReadyThreadDispatcher();
 		StopStallWatchdog();
 		if (!WaitForGuestThreadQuiescence(TimeSpan.FromSeconds(5)))
