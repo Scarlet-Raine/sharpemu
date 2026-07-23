@@ -139,6 +139,81 @@ public sealed class PhysicalVirtualMemoryTests
         Assert.Equal(0UL, (ulong)memory.GetPointer(0x0001_0000));
     }
 
+    [Fact]
+    public void DirectMemoryAliasSharesWritesBetweenPhysicalAndVirtualViews()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var memory = new PhysicalVirtualMemory();
+        const ulong physicalAddress = 0x0000_0000_2001_0000;
+        const ulong virtualAddress = 0x0000_0240_0000_0000;
+        const ulong size = 0x0001_0000;
+
+        Assert.True(memory.TryMapDirectMemoryAlias(physicalAddress, virtualAddress, size, executable: false));
+        Assert.True(memory.TryWrite(virtualAddress + 0x7100, [0x2A]));
+
+        Span<byte> value = stackalloc byte[1];
+        Assert.True(memory.TryRead(physicalAddress + 0x7100, value));
+        Assert.Equal(0x2A, value[0]);
+    }
+
+    [Fact]
+    public void DirectMemoryAliasReplacesAnInteriorPlaceholderRange()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        using var memory = new PhysicalVirtualMemory();
+        const ulong reservationAddress = 0x0000_0010_0000_0000;
+        const ulong reservationSize = 0x0000_0001_4000_0000;
+        const ulong physicalAddress = 0x0000_0000_2001_0000;
+        const ulong virtualAddress = reservationAddress + 0x0010_0000;
+        const ulong size = 0x0001_0000;
+
+        Assert.Equal(
+            reservationAddress,
+            memory.AllocateAt(reservationAddress, reservationSize, executable: false, allowAlternative: false));
+        Assert.True(memory.TryMapDirectMemoryAlias(physicalAddress, virtualAddress, size, executable: false));
+        Assert.True(memory.TryWrite(virtualAddress + 0x7100, [0x2A]));
+
+        Span<byte> value = stackalloc byte[1];
+        Assert.True(memory.TryRead(physicalAddress + 0x7100, value));
+        Assert.Equal(0x2A, value[0]);
+    }
+
+    [Fact]
+    public void DirectMemoryAliasInsidePlaceholderReleasesAllViewsOnDispose()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        const ulong reservationAddress = 0x0000_0030_0000_0000;
+        const ulong reservationSize = 0x0000_0001_4000_0000;
+        const ulong physicalAddress = 0x0000_0000_2101_0000;
+        const ulong virtualAddress = reservationAddress + 0x0010_0000;
+        const ulong size = 0x0001_0000;
+
+        using (var memory = new PhysicalVirtualMemory())
+        {
+            Assert.Equal(
+                reservationAddress,
+                memory.AllocateAt(reservationAddress, reservationSize, executable: false, allowAlternative: false));
+            Assert.True(memory.TryMapDirectMemoryAlias(physicalAddress, virtualAddress, size, executable: false));
+        }
+
+        using var replacement = new PhysicalVirtualMemory();
+        Assert.Equal(
+            reservationAddress,
+            replacement.AllocateAt(reservationAddress, reservationSize, executable: false, allowAlternative: false));
+    }
+
     // 3. Free-list reuse: a freed range is served back by first-fit allocation,
     //    preferring the lowest fitting free range over the larger trailing span.
     [Fact]

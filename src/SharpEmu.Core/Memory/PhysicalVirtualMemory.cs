@@ -9,7 +9,7 @@ using SharpEmu.Logging;
 
 namespace SharpEmu.Core.Memory;
 
-public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryAllocator, IGuestAddressSpace, IDisposable
+public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryAllocator, IGuestAddressSpace, IDirectMemoryAliasSpace, IDisposable
 {
     private static readonly SharpEmuLogger Log = SharpEmuLog.For("VMEM");
 
@@ -124,8 +124,140 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
     public PhysicalVirtualMemory(IHostMemory? hostMemory = null)
     {
-        _hostMemory = hostMemory ?? CrossPlatformHostMemory.Instance;
+        _hostMemory = hostMemory ?? HostPlatform.Current.Memory;
     }
+
+    public bool TryMapDirectMemoryAlias(
+        ulong physicalAddress,
+        ulong virtualAddress,
+        ulong size,
+        bool executable)
+    {
+        if (physicalAddress == 0 || virtualAddress == 0 || physicalAddress == virtualAddress ||
+            size == 0 || ulong.MaxValue - physicalAddress < size - 1 ||
+            ulong.MaxValue - virtualAddress < size - 1 ||
+            _hostMemory is not ISharedMemoryMappingHost sharedMemory)
+        {
+            TraceDirectAliasFailure("unsupported", physicalAddress, virtualAddress, size);
+            return false;
+        }
+
+        var protection = executable
+            ? HostPageProtection.ReadWriteExecute
+            : HostPageProtection.ReadWrite;
+
+        _gate.EnterWriteLock();
+        try
+        {
+            var physicalRegion = FindRegion(physicalAddress, size);
+            var virtualRegion = FindRegion(virtualAddress, size);
+            if (physicalRegion is not null ||
+                (virtualRegion is not null && !virtualRegion.IsReplaceableReservation))
+            {
+                TraceDirectAliasFailure(
+                    $"occupied physical_region=0x{physicalRegion?.VirtualAddress ?? 0:X16}/0x{physicalRegion?.Size ?? 0:X16} " +
+                    $"virtual_region=0x{virtualRegion?.VirtualAddress ?? 0:X16}/0x{virtualRegion?.Size ?? 0:X16}",
+                    physicalAddress,
+                    virtualAddress,
+                    size);
+                return false;
+            }
+
+            if (!sharedMemory.TryMapShared(physicalAddress, virtualAddress, size, protection))
+            {
+                TraceDirectAliasFailure("host", physicalAddress, virtualAddress, size);
+                return false;
+            }
+
+            InsertRegionSorted(CreateMappedRegion(physicalAddress, size, executable));
+            if (virtualRegion is null)
+            {
+                InsertRegionSorted(CreateMappedRegion(virtualAddress, size, executable));
+            }
+            else
+            {
+                ReplaceReservationRangeWithMapping(virtualRegion, virtualAddress, size, executable);
+            }
+            Interlocked.Increment(ref _mappingGeneration);
+            return true;
+        }
+        finally
+        {
+            _gate.ExitWriteLock();
+        }
+    }
+
+    private static void TraceDirectAliasFailure(string reason, ulong physicalAddress, ulong virtualAddress, ulong size)
+    {
+        if (!string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_SHARED_MEMORY_MAP"), "1", StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] direct_alias {reason}: physical=0x{physicalAddress:X16} " +
+            $"virtual=0x{virtualAddress:X16} size=0x{size:X16}");
+    }
+
+    private static MemoryRegion CreateMappedRegion(ulong address, ulong size, bool executable) => new()
+    {
+        VirtualAddress = address,
+        Size = size,
+        IsExecutable = executable,
+        IsReservedOnly = false,
+        Protection = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE
+    };
+
+    /// <summary>
+    /// Replaces the mapped portion of a placeholder with an ordinary region.
+    /// Windows splits a placeholder around an interior MapViewOfFile3 view, so
+    /// the region model must do the same or disposal would only release the
+    /// original prefix and leak the view and trailing placeholder.
+    /// </summary>
+    private void ReplaceReservationRangeWithMapping(
+        MemoryRegion reservation,
+        ulong mappedAddress,
+        ulong mappedSize,
+        bool executable)
+    {
+        var reservationEnd = checked(reservation.VirtualAddress + reservation.Size);
+        var mappedEnd = checked(mappedAddress + mappedSize);
+        if (!reservation.IsReplaceableReservation ||
+            mappedAddress < reservation.VirtualAddress ||
+            mappedEnd > reservationEnd)
+        {
+            throw new InvalidOperationException("Direct-memory alias is outside its replaceable reservation.");
+        }
+
+        _regions.Remove(reservation);
+        if (reservation.VirtualAddress != mappedAddress)
+        {
+            InsertRegionSorted(CreateReservationSlice(
+                reservation,
+                reservation.VirtualAddress,
+                mappedAddress - reservation.VirtualAddress));
+        }
+
+        InsertRegionSorted(CreateMappedRegion(mappedAddress, mappedSize, executable));
+
+        if (mappedEnd != reservationEnd)
+        {
+            InsertRegionSorted(CreateReservationSlice(
+                reservation,
+                mappedEnd,
+                reservationEnd - mappedEnd));
+        }
+    }
+
+    private static MemoryRegion CreateReservationSlice(MemoryRegion source, ulong address, ulong size) => new()
+    {
+        VirtualAddress = address,
+        Size = size,
+        IsExecutable = source.IsExecutable,
+        IsReservedOnly = source.IsReservedOnly,
+        IsReplaceableReservation = source.IsReplaceableReservation,
+        Protection = source.Protection
+    };
 
     private sealed class CrossPlatformHostMemory : IHostMemory
     {
@@ -302,6 +434,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var protection = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
         var hostProtection = executable ? HostPageProtection.ReadWriteExecute : HostPageProtection.ReadWrite;
         var reservedOnly = false;
+        var replaceableReservation = false;
         var preferReserveOnly = !executable &&
             alignedSize >= LargeDataReserveThreshold &&
             alignedSize > FullCommitRegionLimit;
@@ -309,10 +442,26 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         ulong result = 0;
         if (preferReserveOnly)
         {
-            result = _hostMemory.Reserve(desiredAddress, alignedSize, HostPageProtection.ReadWrite);
+            if (_hostMemory is IReplaceableReservationHost replaceableHost)
+            {
+                result = replaceableHost.ReservePlaceholder(desiredAddress, alignedSize);
+                replaceableReservation = result != 0;
+            }
+            else
+            {
+                result = _hostMemory.Reserve(desiredAddress, alignedSize, HostPageProtection.ReadWrite);
+            }
             if (result == 0 && allowAlternative)
             {
-                result = _hostMemory.Reserve(0, alignedSize, HostPageProtection.ReadWrite);
+                if (_hostMemory is IReplaceableReservationHost alternateReplaceableHost)
+                {
+                    result = alternateReplaceableHost.ReservePlaceholder(0, alignedSize);
+                    replaceableReservation = result != 0;
+                }
+                else
+                {
+                    result = _hostMemory.Reserve(0, alignedSize, HostPageProtection.ReadWrite);
+                }
             }
 
             if (result != 0)
@@ -409,6 +558,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 Size = alignedSize,
                 IsExecutable = executable,
                 IsReservedOnly = reservedOnly,
+                IsReplaceableReservation = replaceableReservation,
                 Protection = protection
             });
         }
@@ -1695,6 +1845,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         public ulong Size { get; set; }
         public bool IsExecutable { get; set; }
         public bool IsReservedOnly { get; set; }
+        public bool IsReplaceableReservation { get; set; }
         public uint Protection { get; set; }
     }
 

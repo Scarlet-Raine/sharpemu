@@ -3164,6 +3164,7 @@ public static partial class KernelMemoryCompatExports
         }
 
         ulong mappedAddress;
+        var sharedAlias = false;
         lock (_memoryGate)
         {
             var effectiveAlignment = alignment == 0 ? OrbisPageSize : alignment;
@@ -3175,7 +3176,23 @@ public static partial class KernelMemoryCompatExports
                     : AlignUp(_nextVirtualAddress == 0 ? DefaultMapSearchBase : _nextVirtualAddress, effectiveAlignment);
 
             var reserved = false;
-            if (fixedMapping && requestedAddress != 0)
+            var aliasSupported = KernelVirtualRangeAllocator.TryResolveAddressSpace(ctx.Memory, out var aliasAddressSpace) &&
+                aliasAddressSpace is IDirectMemoryAliasSpace;
+            sharedAlias = requestedAddress != 0 &&
+                directMemoryStart != 0 &&
+                requestedAddress != directMemoryStart &&
+                aliasAddressSpace is IDirectMemoryAliasSpace aliasSpace &&
+                aliasSpace.TryMapDirectMemoryAlias(
+                    directMemoryStart,
+                    requestedAddress,
+                    length,
+                    (protection & OrbisProtCpuExec) != 0);
+            if (sharedAlias)
+            {
+                mappedAddress = requestedAddress;
+                reserved = true;
+            }
+            else if (fixedMapping && requestedAddress != 0)
             {
                 mappedAddress = requestedAddress;
                 reserved = IsGuestRangeBacked(ctx, requestedAddress, length);
@@ -3224,7 +3241,7 @@ public static partial class KernelMemoryCompatExports
             if (ShouldTraceDirectMemory())
             {
                 Console.Error.WriteLine(
-                    $"[LOADER][TRACE] map_direct reserve: requested=0x{requestedAddress:X16} desired=0x{desiredAddress:X16} reserved={reserved} mapped=0x{mappedAddress:X16}");
+                    $"[LOADER][TRACE] map_direct reserve: requested=0x{requestedAddress:X16} desired=0x{desiredAddress:X16} reserved={reserved} alias_supported={aliasSupported} shared_alias={sharedAlias} mapped=0x{mappedAddress:X16}");
             }
             if (!reserved && !fixedMapping)
             {
@@ -3255,7 +3272,8 @@ public static partial class KernelMemoryCompatExports
                 DirectStart: directMemoryStart));
         }
 
-        if (KernelVirtualRangeAllocator.TryResolveAddressSpace(ctx.Memory, out var addressSpace) &&
+        if (!sharedAlias &&
+            KernelVirtualRangeAllocator.TryResolveAddressSpace(ctx.Memory, out var addressSpace) &&
             !addressSpace.TryCommit(mappedAddress, length))
         {
             lock (_memoryGate)
