@@ -60,6 +60,40 @@ public sealed class ImportTrampolineAbiTests
         }
     }
 
+    [Fact]
+    public unsafe void GeneratedTrampoline_RestoresRaxFromHleReturnValue()
+    {
+        if (RuntimeInformation.ProcessArchitecture != Architecture.X64)
+        {
+            return;
+        }
+
+        var code = CreateTrampolineBytes();
+
+        // The trampoline must restore RAX with the HLE return value written
+        // by the managed gateway to the volatile save area at [argPackPtr-176].
+        // After `mov rsp, r12` (where R12 = argPackPtr), RSP == argPackPtr,
+        // so the restore is `mov rax, [rsp-176]`.
+        // Encoding: REX.W (0x48) + MOV r64,r/m64 (0x8B) + ModRM (0x84) +
+        //           SIB (0x24) + disp32 (-176 = 0xFFFFFF50).
+        Span<byte> raxRestore = stackalloc byte[8];
+        raxRestore[0] = 0x48; // REX.W
+        raxRestore[1] = 0x8B; // MOV r64, r/m64
+        raxRestore[2] = 0x84; // ModRM: mod=10, reg=000 (RAX), r/m=100 (SIB)
+        raxRestore[3] = 0x24; // SIB: base=100 (RSP)
+        BinaryPrimitives.WriteInt32LittleEndian(raxRestore[4..], -176);
+        AssertContains(code, raxRestore);
+
+        // The RAX restore must appear after the XMM0-1 restores and before
+        // the GPR pops. Verify the RAX restore precedes the first pop (RDI).
+        var raxRestoreIndex = code.IndexOf(raxRestore);
+        Assert.True(raxRestoreIndex >= 0, "RAX restore instruction not found.");
+
+        // Find the first pop rdi (0x5F) after the RAX restore.
+        var popRdiIndex = code[(raxRestoreIndex + 8)..].IndexOf((byte)0x5F);
+        Assert.True(popRdiIndex >= 0, "pop rdi not found after RAX restore.");
+    }
+
     private static unsafe byte[] CreateTrampolineBytes()
     {
         var backend = (DirectExecutionBackend)RuntimeHelpers.GetUninitializedObject(
