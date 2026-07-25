@@ -370,7 +370,52 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var alignedSize = (size + 0xFFF) & ~0xFFFUL;
         var protection = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
         var hostProtection = executable ? HostPageProtection.ReadWriteExecute : HostPageProtection.ReadWrite;
-        var result = _hostMemory.Allocate(desiredAddress, alignedSize, hostProtection);
+
+        // Large non-executable requests are reserve-only address-space claims — most
+        // often sceKernelReserveVirtualRange reserving hundreds of GiB of guest space
+        // before any of it is backed. Committing the whole window here charges host
+        // memory/pagefile for every page, so e.g. a 512 GiB reserve either fails and
+        // forces the search loop in TryAllocateAtOrAbove to retry up to 0x10000 times
+        // or grows the pagefile by the entire reservation; both stall boot for tens of
+        // seconds. A committed region is also not a replaceable reservation, so a later
+        // sceKernelMapDirectMemory alias into the reserved range is rejected as
+        // occupied. Reserve a placeholder instead and let pages commit lazily, matching
+        // AllocateAt's reserve-only path.
+        var reservedOnly = false;
+        var replaceableReservation = false;
+        var preferReserveOnly = !executable &&
+            alignedSize >= LargeDataReserveThreshold &&
+            alignedSize > FullCommitRegionLimit;
+
+        ulong result = 0;
+        if (preferReserveOnly)
+        {
+            if (_hostMemory is IReplaceableReservationHost replaceableHost)
+            {
+                result = replaceableHost.ReservePlaceholder(desiredAddress, alignedSize);
+                if (result != 0)
+                {
+                    reservedOnly = true;
+                    replaceableReservation = true;
+                }
+            }
+            else
+            {
+                result = _hostMemory.Reserve(desiredAddress, alignedSize, HostPageProtection.ReadWrite);
+                if (result != 0)
+                {
+                    reservedOnly = true;
+                }
+            }
+        }
+
+        if (result == 0)
+        {
+            result = _hostMemory.Allocate(desiredAddress, alignedSize, hostProtection);
+            reservedOnly = false;
+            replaceableReservation = false;
+        }
+
         if (result == 0)
         {
             return false;
@@ -392,7 +437,8 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 VirtualAddress = actualAddress,
                 Size = alignedSize,
                 IsExecutable = executable,
-                IsReservedOnly = false,
+                IsReservedOnly = reservedOnly,
+                IsReplaceableReservation = replaceableReservation,
                 Protection = protection
             });
         }
@@ -401,7 +447,9 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             _gate.ExitWriteLock();
         }
 
-        var allocationKind = executable ? "executable memory" : "data memory";
+        var allocationKind = reservedOnly
+            ? "reserved data memory (lazy commit)"
+            : (executable ? "executable memory" : "data memory");
         TraceVmem($"Allocated exact {allocationKind}: 0x{actualAddress:X16} - 0x{actualAddress + alignedSize:X16} ({alignedSize} bytes)");
         return true;
     }
@@ -511,7 +559,16 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         var actualAddress = result;
 
         var lazyPrimeState = "n/a";
-        if (reservedOnly)
+        if (reservedOnly && replaceableReservation)
+        {
+            // Priming a placeholder reservation would split it and replace the
+            // primed head with a private allocation, which permanently breaks
+            // later direct-memory aliases (MapViewOfFile3 REPLACE_PLACEHOLDER)
+            // into those pages. Placeholder pages commit on demand through the
+            // placeholder-aware host commit instead.
+            lazyPrimeState = "skip:placeholder";
+        }
+        else if (reservedOnly)
         {
             var primeBytes = Math.Min(alignedSize, LazyReservePrimeBytes);
             if (primeBytes != 0)
@@ -593,22 +650,30 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
         // Walk the range page-run by page-run. VirtualQuery reports the largest run
         // of same-state pages from the queried address, so a single query advances
-        // us over whole free or occupied stretches. Only free stretches get backed;
-        // stretches already reserved or committed by another allocation are left as
-        // they are, which is exactly what a fixed mapping does on hardware.
+        // us over whole free or occupied stretches.
         //
-        // Because backing may span several disjoint free runs, allocations are
-        // staged: host pages are reserved/committed first, and the corresponding
+        // Free stretches are allocated (reserve+commit); Reserved stretches are
+        // committed in place (they belong to a prior reserve-only allocation such
+        // as sceKernelReserveVirtualRange). Committed stretches are already
+        // accessible and need no action.
+        //
+        // Because backing may span several disjoint runs, allocations are staged:
+        // host pages are reserved/committed first, and the corresponding
         // MemoryRegions are inserted only once every gap in the range has been
         // backed. If any gap fails to back, every earlier host allocation is freed
         // and no region is inserted, so the address space is left untouched.
+        // Committed pages (from Reserved runs) are NOT rolled back — they remain
+        // validly committed within their prior reservation, which is harmless and
+        // allows a retried mapping to succeed.
         var stagedAllocations = new List<(ulong Address, ulong Size)>();
+        var stagedCommits = new List<(ulong Address, ulong Size)>();
 
         var cursor = start;
         while (cursor < end)
         {
             if (!_hostMemory.Query(cursor, out var info))
             {
+                Console.Error.WriteLine($"[LOADER][WARN] TryBackFixedRange: Query failed at cursor=0x{cursor:X16}");
                 goto Rollback;
             }
 
@@ -618,6 +683,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             var runEnd = Math.Min(end, queriedEnd);
             if (runEnd <= cursor)
             {
+                Console.Error.WriteLine($"[LOADER][WARN] TryBackFixedRange: runEnd<=cursor at 0x{cursor:X16} state={info.State} base=0x{info.BaseAddress:X16} regionSize=0x{info.RegionSize:X}");
                 goto Rollback;
             }
 
@@ -627,6 +693,7 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 var allocated = _hostMemory.Allocate(cursor, runSize, hostProtection);
                 if (allocated != cursor)
                 {
+                    Console.Error.WriteLine($"[LOADER][WARN] TryBackFixedRange: Allocate failed at 0x{cursor:X16} size=0x{runSize:X} got=0x{allocated:X16}");
                     if (allocated != 0)
                     {
                         _hostMemory.Free(allocated);
@@ -638,13 +705,31 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 stagedAllocations.Add((cursor, runSize));
                 TraceVmem($"Backed fixed range gap: 0x{cursor:X16} - 0x{runEnd:X16} ({runSize} bytes)");
             }
+            else if (info.State == HostRegionState.Reserved)
+            {
+                // Pages are reserved but not committed -- the guest cannot access
+                // them yet. A fixed mapping (sceKernelBatchMap / MAP_FIXED) on
+                // real hardware makes these pages accessible, so commit them.
+                var runSize = runEnd - cursor;
+                if (!_hostMemory.Commit(cursor, runSize, hostProtection))
+                {
+                    Console.Error.WriteLine($"[LOADER][WARN] TryBackFixedRange: Commit failed at 0x{cursor:X16} size=0x{runSize:X}");
+                    goto Rollback;
+                }
+
+                stagedCommits.Add((cursor, runSize));
+                TraceVmem($"Committed reserved range: 0x{cursor:X16} - 0x{runEnd:X16} ({runSize} bytes)");
+            }
 
             cursor = runEnd;
         }
 
-        if (stagedAllocations.Count == 0)
+        if (stagedAllocations.Count == 0 && stagedCommits.Count == 0)
         {
-            return false;
+            // The entire range was already committed by existing allocations.
+            // For a fixed mapping this is success -- the pages are present and
+            // the guest can use them.
+            return true;
         }
 
         // All gaps backed successfully — insert regions in one batch.
@@ -663,6 +748,23 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     Protection = protection
                 });
             }
+
+            // For committed-reserved runs, only insert a region if one does not
+            // already cover the range (the prior reservation may have registered one).
+            foreach (var (commitAddress, commitSize) in stagedCommits)
+            {
+                if (FindRegion(commitAddress, commitSize) is null)
+                {
+                    InsertRegionSorted(new MemoryRegion
+                    {
+                        VirtualAddress = commitAddress,
+                        Size = commitSize,
+                        IsExecutable = executable,
+                        IsReservedOnly = false,
+                        Protection = protection
+                    });
+                }
+            }
         }
         finally
         {
@@ -672,11 +774,17 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         return true;
 
     Rollback:
+        Console.Error.WriteLine(
+            $"[LOADER][WARN] TryBackFixedRange rollback: addr=0x{address:X16} size=0x{size:X} " +
+            $"cursor=0x{cursor:X16} staged_allocs={stagedAllocations.Count} staged_commits={stagedCommits.Count}");
         foreach (var (gapAddress, _) in stagedAllocations)
         {
             _hostMemory.Free(gapAddress);
         }
 
+        // stagedCommits are intentionally NOT rolled back: they remain committed
+        // within their prior reservation. This is harmless and allows a retried
+        // fixed mapping to succeed on the next attempt.
         return false;
     }
 
@@ -746,7 +854,58 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                 return true;
             }
 
+            // The exact claim failed on a host allocation this class does not
+            // track (loader images, runtime heaps, thread stacks). Stepping by
+            // the alignment rescans the same foreign block one granule at a
+            // time and exhausts the attempt budget long before clearing it —
+            // for a multi-hundred-GiB reserve that forces the caller into a
+            // host-chosen fallback address that later fixed mappings collide
+            // with. Jump the cursor past the blocking region instead.
+            if (TryGetForeignBlockEnd(cursor, alignedSize, out var foreignBlockEnd) &&
+                foreignBlockEnd > cursor)
+            {
+                cursor = AlignUp(foreignBlockEnd, effectiveAlignment);
+                continue;
+            }
+
             cursor = AlignUp(cursor + effectiveAlignment, effectiveAlignment);
+        }
+
+        return false;
+    }
+
+    private bool TryGetForeignBlockEnd(ulong address, ulong size, out ulong blockEnd)
+    {
+        blockEnd = 0;
+        if (ulong.MaxValue - address < size)
+        {
+            return false;
+        }
+
+        var end = address + size;
+        var cursor = address;
+        while (cursor < end)
+        {
+            if (!_hostMemory.Query(cursor, out var info))
+            {
+                return false;
+            }
+
+            var runEnd = info.RegionSize > ulong.MaxValue - info.BaseAddress
+                ? ulong.MaxValue
+                : info.BaseAddress + info.RegionSize;
+            if (runEnd <= cursor)
+            {
+                return false;
+            }
+
+            if (info.State != HostRegionState.Free)
+            {
+                blockEnd = runEnd;
+                return true;
+            }
+
+            cursor = runEnd;
         }
 
         return false;

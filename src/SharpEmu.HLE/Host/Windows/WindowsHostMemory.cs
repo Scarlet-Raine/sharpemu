@@ -47,7 +47,96 @@ internal sealed unsafe partial class WindowsHostMemory : ISharedMemoryMappingHos
 
     public bool Commit(ulong address, ulong size, HostPageProtection protection)
     {
-        return VirtualAlloc((void*)address, (nuint)size, MEM_COMMIT, ToNativeProtection(protection)) != null;
+        if (VirtualAlloc((void*)address, (nuint)size, MEM_COMMIT, ToNativeProtection(protection)) != null)
+        {
+            return true;
+        }
+
+        // MEM_COMMIT is rejected on MEM_RESERVE_PLACEHOLDER pages, which back
+        // the guest's reserve-only windows (kept replaceable so direct-memory
+        // aliases can map into them). A fixed mapping such as sceKernelBatchMap
+        // or a lazy fault commit inside such a window must still succeed:
+        // split each placeholder run to the requested range and replace it
+        // with a committed private allocation.
+        return TryCommitReplacingPlaceholders(address, size, ToNativeProtection(protection));
+    }
+
+    private static bool TryCommitReplacingPlaceholders(ulong address, ulong size, uint nativeProtection)
+    {
+        if (size == 0)
+        {
+            return false;
+        }
+
+        var end = ulong.MaxValue - address < size ? ulong.MaxValue : address + size;
+        var cursor = address;
+        while (cursor < end)
+        {
+            if (VirtualQuery((void*)cursor, out var info, (nuint)sizeof(MemoryBasicInformation64)) == 0)
+            {
+                return false;
+            }
+
+            var regionEnd = ulong.MaxValue - info.BaseAddress < info.RegionSize
+                ? ulong.MaxValue
+                : info.BaseAddress + info.RegionSize;
+            if (regionEnd <= cursor)
+            {
+                return false;
+            }
+
+            var runEnd = Math.Min(end, regionEnd);
+            if (info.State == MEM_COMMIT)
+            {
+                cursor = runEnd;
+                continue;
+            }
+
+            if (info.State != MEM_RESERVE)
+            {
+                return false;
+            }
+
+            if (info.AllocationProtect != PAGE_NOACCESS)
+            {
+                // An ordinary reservation: a plain commit of this run works.
+                if (VirtualAlloc((void*)cursor, (nuint)(runEnd - cursor), MEM_COMMIT, nativeProtection) == null)
+                {
+                    return false;
+                }
+
+                cursor = runEnd;
+                continue;
+            }
+
+            // Placeholder run. Splitting operates at allocation granularity and
+            // the placeholder's own bounds are granularity-aligned, so widening
+            // the request to granularity stays inside this run.
+            var replaceStart = Math.Max(info.BaseAddress, cursor & ~(AllocationGranularity - 1));
+            var replaceEnd = Math.Min(
+                regionEnd,
+                (runEnd + AllocationGranularity - 1) & ~(AllocationGranularity - 1));
+            if (!TryPartitionPlaceholder(replaceStart, replaceEnd - replaceStart, out _))
+            {
+                return false;
+            }
+
+            if (VirtualAlloc2(
+                    GetCurrentProcess(),
+                    (void*)replaceStart,
+                    (nuint)(replaceEnd - replaceStart),
+                    MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                    nativeProtection,
+                    null,
+                    0) == null)
+            {
+                return false;
+            }
+
+            cursor = runEnd;
+        }
+
+        return true;
     }
 
     public bool Free(ulong address)

@@ -96,6 +96,25 @@ public sealed class GuestMemoryAllocatorTests
     }
 
     [Fact]
+    public void TryAllocateAtExactReservesLargeNonExecutableRangesWithoutCommitting()
+    {
+        // sceKernelReserveVirtualRange reserves huge guest ranges (e.g. 512 GiB)
+        // before anything backs them. Such a request must be reserved, not
+        // committed: LazyHostMemory refuses commit (Allocate -> 0) and only
+        // honours Reserve, so the exact-address claim can only succeed via the
+        // reserve-only path. Committing here would fail the allocation outright
+        // and, on a real host, charge the entire window to the pagefile.
+        const ulong address = 0x00005000_0000_0000;
+        const ulong size = 8UL << 30; // 8 GiB, above the reserve-only threshold
+        using var host = new LazyHostMemory(address);
+        using var memory = new PhysicalVirtualMemory(host);
+
+        Assert.True(memory.TryAllocateAtExact(address, size, executable: false, out var actual));
+        Assert.Equal(address, actual);
+        Assert.Empty(host.CommitCalls);
+    }
+
+    [Fact]
     public void AlignedAllocationDoesNotRetainOverallocatedMappingsOutsideMacOS()
     {
         if (OperatingSystem.IsMacOS())
@@ -160,15 +179,109 @@ public sealed class GuestMemoryAllocatorTests
     }
 
     [Fact]
-    public void TryBackFixedRangeReturnsFalseWhenRangeIsFullyOccupied()
+    public void TryBackFixedRangeReturnsTrueWhenRangeIsFullyCommitted()
     {
+        // A fixed mapping (sceKernelBatchMap) over already-committed pages is
+        // success: the pages are present and the guest can use them.
         const ulong rangeBase = 0x0000_0020_2F00_0000;
         const ulong rangeSize = 0x40_0000;
         using var host = new PartialOverlapHostMemory(rangeBase, rangeSize, rangeSize);
         using var memory = new PhysicalVirtualMemory(host);
 
-        Assert.False(memory.TryBackFixedRange(rangeBase, rangeSize, executable: false));
+        Assert.True(memory.TryBackFixedRange(rangeBase, rangeSize, executable: false));
         Assert.Empty(host.AllocationCalls);
+    }
+
+    [Fact]
+    public void TryAllocateAtOrAboveSkipsForeignHostRegionsInsteadOfSteppingThroughThem()
+    {
+        // A foreign host allocation (loader image, runtime heap) inside the
+        // search window is not tracked by PhysicalVirtualMemory. Stepping by
+        // the alignment would take blockSize/alignment attempts to clear it —
+        // more than the 0x10000 budget for a multi-GiB block — and the caller
+        // then falls back to a host-chosen address that later fixed mappings
+        // collide with. The search must jump past the foreign block instead.
+        const ulong searchBase = 0x0000_0040_0000_0000;
+        const ulong foreignSize = 2UL << 30; // 2 GiB >> 0x10000 * 0x4000 budget
+        const ulong alignment = 0x4000;
+        using var host = new ForeignBlockHostMemory(searchBase, foreignSize);
+        using var memory = new PhysicalVirtualMemory(host);
+
+        Assert.True(memory.TryAllocateAtOrAbove(searchBase, 0x10000, false, alignment, out var actualAddress));
+        Assert.Equal(searchBase + foreignSize, actualAddress);
+        // One failed exact claim at the blocked cursor, one success beyond it.
+        Assert.Equal(2, host.AllocationCalls.Count);
+    }
+
+    private sealed class ForeignBlockHostMemory(ulong foreignStart, ulong foreignSize) : IHostMemory, IDisposable
+    {
+        private readonly ulong _foreignEnd = foreignStart + foreignSize;
+
+        public List<(ulong Address, ulong Size)> AllocationCalls { get; } = [];
+
+        public ulong Allocate(ulong desiredAddress, ulong size, HostPageProtection protection)
+        {
+            AllocationCalls.Add((desiredAddress, size));
+            var overlapsForeign = desiredAddress < _foreignEnd &&
+                foreignStart < desiredAddress + size;
+            return overlapsForeign ? 0 : desiredAddress;
+        }
+
+        public ulong Reserve(ulong desiredAddress, ulong size, HostPageProtection protection) =>
+            Allocate(desiredAddress, size, protection);
+
+        public bool Commit(ulong address, ulong size, HostPageProtection protection) => true;
+
+        public bool Free(ulong address) => true;
+
+        public bool Protect(ulong address, ulong size, HostPageProtection protection, out uint rawOldProtection)
+        {
+            rawOldProtection = 0;
+            return true;
+        }
+
+        public bool ProtectRaw(ulong address, ulong size, uint rawProtection, out uint rawOldProtection)
+        {
+            rawOldProtection = 0;
+            return true;
+        }
+
+        public bool Query(ulong address, out HostRegionInfo info)
+        {
+            if (address >= foreignStart && address < _foreignEnd)
+            {
+                info = new HostRegionInfo(
+                    address,
+                    foreignStart,
+                    _foreignEnd - address,
+                    HostRegionState.Committed,
+                    RawState: 0x1000,
+                    HostPageProtection.ReadWrite,
+                    RawProtection: 0x04,
+                    RawAllocationProtection: 0x04);
+                return true;
+            }
+
+            var freeEnd = address < foreignStart ? foreignStart : ulong.MaxValue;
+            info = new HostRegionInfo(
+                address,
+                AllocationBase: 0,
+                freeEnd - address,
+                HostRegionState.Free,
+                RawState: 0x10000,
+                HostPageProtection.NoAccess,
+                RawProtection: 0x01,
+                RawAllocationProtection: 0);
+            return true;
+        }
+
+        public void FlushInstructionCache(ulong address, ulong size)
+        {
+        }
+
+        public void Dispose()
+        {
+        }
     }
 
     private sealed class PartialOverlapHostMemory : IHostMemory, IDisposable
