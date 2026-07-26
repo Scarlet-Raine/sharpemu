@@ -158,6 +158,100 @@ public sealed class AjmExportsTests : IDisposable
         }
     }
 
+    // GTA SA:DE's FMOD decoder-init chain: these NIDs were unresolved, which
+    // surfaced as an endless "sceAjmBatchJobInitialize() failed: 0x80020002"
+    // printf storm (and a never-completing async-I/O wait on the pak
+    // streamer's side). Registration is the regression contract.
+    [Fact]
+    public void BatchJobAndSingularAioExports_RegisterForBothGenerations()
+    {
+        foreach (var generation in new[] { Generation.Gen4, Generation.Gen5 })
+        {
+            var manager = new ModuleManager();
+            manager.RegisterExports(SharpEmu.Generated.SysAbiExportRegistry.CreateExports(generation));
+
+            Assert.True(manager.TryGetExport("ezM2OhNxzck", out var jobInitialize));
+            Assert.Equal("sceAjmBatchJobInitialize", jobInitialize.Name);
+            Assert.True(manager.TryGetExport("SkEwpiu3tZg", out var gapless));
+            Assert.Equal("sceAjmBatchJobSetGaplessDecode", gapless.Name);
+            Assert.True(manager.TryGetExport("AxhcqVv5AYU", out var strError));
+            Assert.Equal("sceAjmStrError", strError.Name);
+            Assert.True(manager.TryGetExport("KOF-oJbQVvc", out var waitRequest));
+            Assert.Equal("sceKernelAioWaitRequest", waitRequest.Name);
+            Assert.True(manager.TryGetExport("2pOuoWoCxdk", out var pollRequest));
+            Assert.Equal("sceKernelAioPollRequest", pollRequest.Name);
+        }
+    }
+
+    [Fact]
+    public void BatchJobInitialize_WritesOkSidebandAndAdvancesCursor()
+    {
+        const ulong infoAddress = MemoryBase + 0x400;
+        const ulong jobBuffer = MemoryBase + 0x800;
+        const ulong sidebandAddress = MemoryBase + 0x600;
+        WriteBatchInfo(infoAddress, jobBuffer, offset: 0, size: 0x200);
+        WriteUInt32(sidebandAddress, 0xDEADBEEF);
+        WriteUInt32(sidebandAddress + 4, 0xDEADBEEF);
+
+        _ctx[CpuRegister.Rdi] = infoAddress;
+        _ctx[CpuRegister.Rsi] = 0x4001;
+        _ctx[CpuRegister.Rdx] = MemoryBase + 0x700;
+        _ctx[CpuRegister.Rcx] = 8;
+        _ctx[CpuRegister.R8] = sidebandAddress;
+        Assert.Equal(0, AjmExports.AjmBatchJobInitialize(_ctx));
+
+        // SceAjmSidebandResult.result / internalResult report success.
+        Assert.Equal(0u, ReadUInt32(sidebandAddress));
+        Assert.Equal(0u, ReadUInt32(sidebandAddress + 4));
+        Assert.Equal(64u, ReadUInt32(infoAddress + 8)); // cursor advanced one job
+    }
+
+    [Fact]
+    public void BatchJobSetGaplessDecode_WritesOkSideband()
+    {
+        const ulong infoAddress = MemoryBase + 0x400;
+        const ulong jobBuffer = MemoryBase + 0x800;
+        const ulong sidebandAddress = MemoryBase + 0x600;
+        WriteBatchInfo(infoAddress, jobBuffer, offset: 0, size: 0x200);
+        WriteUInt32(sidebandAddress, 0xDEADBEEF);
+
+        _ctx[CpuRegister.Rdi] = infoAddress;
+        _ctx[CpuRegister.Rsi] = 0x4001;
+        _ctx[CpuRegister.Rdx] = 0;
+        _ctx[CpuRegister.Rcx] = 0;
+        _ctx[CpuRegister.R8] = sidebandAddress;
+        Assert.Equal(0, AjmExports.AjmBatchJobSetGaplessDecode(_ctx));
+
+        Assert.Equal(0u, ReadUInt32(sidebandAddress));
+        Assert.Equal(64u, ReadUInt32(infoAddress + 8));
+    }
+
+    [Fact]
+    public void AioWaitRequest_ReportsCompletedState()
+    {
+        const ulong stateAddress = MemoryBase + 0x500;
+        WriteUInt32(stateAddress, 0xDEADBEEF);
+
+        _ctx[CpuRegister.Rdi] = 7; // submit id
+        _ctx[CpuRegister.Rsi] = stateAddress;
+        _ctx[CpuRegister.Rdx] = 0; // infinite timeout
+        Assert.Equal(0, SharpEmu.Libs.Kernel.KernelMemoryCompatExports.KernelAioWaitRequest(_ctx));
+
+        // SCE_KERNEL_AIO_STATE_COMPLETED: the synchronous submit already
+        // finished the transfer, so the wait must observe completion.
+        Assert.Equal(3u, ReadUInt32(stateAddress));
+    }
+
+    private void WriteBatchInfo(ulong infoAddress, ulong buffer, ulong offset, ulong size)
+    {
+        Span<byte> info = stackalloc byte[40];
+        info.Clear();
+        BinaryPrimitives.WriteUInt64LittleEndian(info[0..], buffer);
+        BinaryPrimitives.WriteUInt64LittleEndian(info[8..], offset);
+        BinaryPrimitives.WriteUInt64LittleEndian(info[16..], size);
+        Assert.True(_memory.TryWrite(infoAddress, info));
+    }
+
     public void Dispose()
     {
         AjmExports.ResetForTests();

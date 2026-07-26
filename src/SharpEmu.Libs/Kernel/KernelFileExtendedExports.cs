@@ -623,6 +623,34 @@ public static partial class KernelMemoryCompatExports
         Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
     public static int KernelAioWaitRequests(CpuContext ctx) => KernelAioComplete(ctx);
 
+    // Singular siblings: (SceKernelAioSubmitId id, uint32_t* state,
+    // SceKernelUseconds* timeout). GTA SA:DE's pak streamer waits per
+    // submit id through the singular form; leaving it unresolved makes every
+    // async read look permanently pending to the title.
+    [SysAbiExport(Nid = "2pOuoWoCxdk", ExportName = "sceKernelAioPollRequest",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+    public static int KernelAioPollRequest(CpuContext ctx) => KernelAioCompleteSingle(ctx);
+
+    [SysAbiExport(Nid = "KOF-oJbQVvc", ExportName = "sceKernelAioWaitRequest",
+        Target = Generation.Gen4 | Generation.Gen5, LibraryName = "libKernel")]
+    public static int KernelAioWaitRequest(CpuContext ctx) => KernelAioCompleteSingle(ctx);
+
+    private static int KernelAioCompleteSingle(CpuContext ctx)
+    {
+        // Submission already performed the I/O synchronously, so the request
+        // is complete by the time any wait can observe it.
+        var stateAddress = ctx[CpuRegister.Rsi];
+        if (stateAddress != 0)
+        {
+            Span<byte> state = stackalloc byte[sizeof(uint)];
+            BinaryPrimitives.WriteUInt32LittleEndian(state, AioStateCompleted);
+            _ = ctx.Memory.TryWrite(stateAddress, state);
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     private static int KernelAioComplete(CpuContext ctx)
     {
         // Submission already performed the I/O synchronously, so every request

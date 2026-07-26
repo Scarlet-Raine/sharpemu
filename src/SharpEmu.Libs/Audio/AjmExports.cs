@@ -229,6 +229,99 @@ public static class AjmExports
     }
 
     /// <summary>
+    /// Enqueues an instance-initialize job:
+    /// (SceAjmBatchInfo* batch, SceAjmInstanceId instance, const void* param,
+    /// size_t paramSize, SceAjmSidebandResult* result). GTA SA:DE's FMOD AT9
+    /// path calls this per decoder instance; when it was unresolved the stub's
+    /// NOT_FOUND surfaced as the endless
+    /// "sceAjmBatchJobInitialize() failed: 0x80020002" printf storm and the
+    /// game recreated its decoder instances forever. Instant-complete model:
+    /// advance the batch cursor and report success in the 8-byte sideband.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "ezM2OhNxzck",
+        ExportName = "sceAjmBatchJobInitialize",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmBatchJobInitialize(CpuContext ctx)
+    {
+        var infoAddress = ctx[CpuRegister.Rdi];
+        var instanceId = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var paramAddress = ctx[CpuRegister.Rdx];
+        var paramSize = ctx[CpuRegister.Rcx];
+        var resultAddress = ctx[CpuRegister.R8];
+        if (infoAddress == 0)
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidParameter);
+        }
+
+        _ = TryAppendBatchJob(ctx, infoAddress, AjmJobRunSize);
+
+        // SceAjmSidebandResult { int32 result; int32 internalResult; } = OK.
+        if (resultAddress != 0)
+        {
+            Span<byte> sideband = stackalloc byte[sizeof(ulong)];
+            sideband.Clear();
+            _ = ctx.Memory.TryWrite(resultAddress, sideband);
+        }
+
+        Trace(
+            $"batch_job_initialize info=0x{infoAddress:X16} instance=0x{instanceId:X8} " +
+            $"param=0x{paramAddress:X16}+0x{paramSize:X} result=0x{resultAddress:X16}");
+        return ctx.SetReturn(0);
+    }
+
+    /// <summary>
+    /// Error-code-to-string helper used by FMOD's failure printf
+    /// ("... failed: 0x%08X (%s)"). Returning NULL keeps the observable
+    /// output identical to a missing string table; the title already handles
+    /// it (prints "(null)").
+    /// </summary>
+    [SysAbiExport(
+        Nid = "AxhcqVv5AYU",
+        ExportName = "sceAjmStrError",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmStrError(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return 0;
+    }
+
+    /// <summary>
+    /// Gapless-decode setup job, called by FMOD right after the instance
+    /// initialize job with the same (batch, instance, param, flags, result)
+    /// shape. Instant-complete like the other jobs: cursor advance + OK
+    /// sideband so the decoder-init chain proceeds.
+    /// </summary>
+    [SysAbiExport(
+        Nid = "SkEwpiu3tZg",
+        ExportName = "sceAjmBatchJobSetGaplessDecode",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceAjm")]
+    public static int AjmBatchJobSetGaplessDecode(CpuContext ctx)
+    {
+        var infoAddress = ctx[CpuRegister.Rdi];
+        var instanceId = unchecked((uint)ctx[CpuRegister.Rsi]);
+        var resultAddress = ctx[CpuRegister.R8];
+        if (infoAddress == 0)
+        {
+            return ctx.SetReturn(OrbisAjmErrorInvalidParameter);
+        }
+
+        _ = TryAppendBatchJob(ctx, infoAddress, AjmJobRunSize);
+        if (resultAddress != 0)
+        {
+            Span<byte> sideband = stackalloc byte[sizeof(ulong)];
+            sideband.Clear();
+            _ = ctx.Memory.TryWrite(resultAddress, sideband);
+        }
+
+        Trace($"batch_job_set_gapless info=0x{infoAddress:X16} instance=0x{instanceId:X8}");
+        return ctx.SetReturn(0);
+    }
+
+    /// <summary>
     /// Enqueues a decode job on a batch. Titles call this on the Bink/AJM hot
     /// path; leaving it unresolved floods Import WARN spam. This is a silence
     /// stub, not a codec: advance the batch cursor and report the input as
