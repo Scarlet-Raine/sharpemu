@@ -2453,6 +2453,33 @@ public static class KernelPthreadCompatExports
                 Console.Error.WriteLine(
                     $"[BRIDGE][DUMP] ret=0x{frame.ReturnRip:X} rsp=0x{frame.ResumeRsp:X16}");
                 DumpQwordWindow(ctx, "STK", frame.ResumeRsp, 0x400, frame.ResumeRsp);
+
+                // Live code windows: the loader rewrites call sites at load, so
+                // static bytes near a return address can diverge from what
+                // actually executed. Dump the live code preceding the first few
+                // guest-code return candidates on the stack so the true call
+                // sites can be diffed against the static database offline.
+                Span<byte> slot = stackalloc byte[sizeof(ulong)];
+                var emitted = 0;
+                ulong previous = 0;
+                for (ulong offset = 0; offset < 0x400 && emitted < 4; offset += 8)
+                {
+                    if (!ctx.Memory.TryRead(frame.ResumeRsp + offset, slot))
+                    {
+                        break;
+                    }
+
+                    var value = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+                    if (value is <= 0x8_0000_0000 or >= 0x8_8000_0000 || value == previous)
+                    {
+                        continue;
+                    }
+
+                    previous = value;
+                    Console.Error.WriteLine($"[BRIDGE][DUMP] code_at=0x{value:X}");
+                    DumpQwordWindow(ctx, "COD", value - 0x60, 0x80, value);
+                    emitted++;
+                }
             }
         }
     }
