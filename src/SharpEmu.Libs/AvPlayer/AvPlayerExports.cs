@@ -42,6 +42,16 @@ public static class AvPlayerExports
         public bool Paused { get; set; }
         public bool Looping { get; set; }
         public bool EndOfStream { get; set; }
+        public bool VideoEnded { get; set; }
+        public bool AudioEnded { get; set; }
+        // Presentation time of the last audio frame handed to the title;
+        // sceAvPlayerCurrentTime follows this in audio-master sync.
+        public long DeliveredAudioMilliseconds { get; set; }
+        // Host timestamp (Stopwatch ticks) of the last time the title pulled a
+        // frame through any pump export. The deadline watchdog uses staleness
+        // here to distinguish a wedged pump (title stopped calling AvPlayer
+        // entirely) from a healthy one that will reach EOS on its own.
+        public long LastPumpTimestamp { get; set; }
         public Process? Decoder { get; set; }
         public Stream? DecoderOutput { get; set; }
         public Process? AudioDecoder { get; set; }
@@ -111,6 +121,9 @@ public static class AvPlayerExports
             NextFrameIndex = 0;
             NextAudioFrameIndex = 0;
             EndOfStream = false;
+            VideoEnded = false;
+            AudioEnded = false;
+            DeliveredAudioMilliseconds = 0;
         }
     }
 
@@ -282,6 +295,11 @@ public static class AvPlayerExports
             player.Started = true;
             player.Paused = false;
             player.EndOfStream = false;
+            // Playback time advances from Start on hardware, not from the
+            // title's first frame pull; the duration-based end-of-stream
+            // check above depends on it.
+            player.PlaybackClock.Start();
+            player.LastPumpTimestamp = Stopwatch.GetTimestamp();
             Trace($"start handle=0x{player.Handle:X16}");
         }
 
@@ -312,6 +330,7 @@ public static class AvPlayerExports
             player.Started = false;
         }
 
+        Console.Error.WriteLine($"[AVPLAYER][INFO] stop handle=0x{player.Handle:X16}");
         NotifyEvent(ctx, player, 1); // StateStop
         return SetReturn(ctx, 0);
     }
@@ -356,7 +375,7 @@ public static class AvPlayerExports
             }
 
             player.Paused = false;
-            if (player.Decoder is not null)
+            if (player.Started)
             {
                 player.PlaybackClock.Start();
             }
@@ -379,6 +398,10 @@ public static class AvPlayerExports
             }
 
             player.Looping = ctx[CpuRegister.Rsi] != 0;
+            // Unconditional: rare call, and whether the startup movie loops
+            // decides the whole end-of-stream flow.
+            Console.Error.WriteLine(
+                $"[AVPLAYER][INFO] set_looping handle=0x{player.Handle:X16} looping={player.Looping}");
             return SetReturn(ctx, 0);
         }
     }
@@ -443,13 +466,85 @@ public static class AvPlayerExports
         LibraryName = "libSceAvPlayer")]
     public static int AvPlayerIsActive(CpuContext ctx)
     {
+        PlayerState? endedPlayer = null;
+        var active = 0;
         lock (StateGate)
         {
-            return SetReturn(
-                ctx,
-                Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) &&
-                player.Started && !player.EndOfStream ? 1 : 0);
+            if (Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
+            {
+                if (ReachedEndOfStreamLocked(player))
+                {
+                    endedPlayer = player;
+                }
+
+                active = player.Started && !player.EndOfStream ? 1 : 0;
+            }
         }
+
+        if (endedPlayer is not null)
+        {
+            NotifyEvent(ctx, endedPlayer, 1); // StateStop at end of stream
+        }
+
+        return SetReturn(ctx, active);
+    }
+
+    /// <summary>
+    /// Hardware sceAvPlayer is a realtime pipeline: playback reaches the end
+    /// of the stream on its own clock and reports STATE_STOP through the
+    /// event callback no matter how the title pumps frames. This decoder is
+    /// pull-based, so the end is detected two ways, whichever comes first:
+    /// - Natural content end: every stream the title actually consumed has
+    ///   drained to pipe EOF.
+    /// - Realtime duration elapsed: matches hardware timing exactly — the
+    ///   16.3 s stinger ends 16.3 s after Start even when the title pumps
+    ///   slower than realtime. UE titles loop their startup movie until the
+    ///   background load finishes (GTA SA:DE replays the Rockstar stinger by
+    ///   design), so delaying the end to the pump pace holds that loop — and
+    ///   the loading screen — hostage; the original frozen-intro wedge was
+    ///   exactly the no-end case.
+    /// Returns true when the player just transitioned to end-of-stream; the
+    /// caller must post the STATE_STOP event after releasing
+    /// <see cref="StateGate"/> (guest event callbacks may re-enter AvPlayer
+    /// exports).
+    /// </summary>
+    private static bool ReachedEndOfStreamLocked(PlayerState player)
+    {
+        if (!player.Started || player.Paused || player.EndOfStream ||
+            player.SourcePath is null)
+        {
+            return false;
+        }
+
+        var contentEnded =
+            (player.VideoEnded || player.AudioEnded) &&
+            (player.VideoEnded || player.DecoderOutput is null) &&
+            (player.AudioEnded || player.AudioDecoderOutput is null);
+        if (!contentEnded &&
+            (player.DurationMilliseconds == 0 ||
+             (ulong)player.PlaybackClock.ElapsedMilliseconds < player.DurationMilliseconds))
+        {
+            return false;
+        }
+
+        if (player.Looping)
+        {
+            player.ResetPlayback();
+            player.Started = true;
+            Console.Error.WriteLine(
+                $"[AVPLAYER][INFO] loop_restart handle=0x{player.Handle:X16} " +
+                $"video_ended={player.VideoEnded} audio_ended={player.AudioEnded}");
+            return false;
+        }
+
+        player.EndOfStream = true;
+        player.PlaybackClock.Stop();
+        Console.Error.WriteLine(
+            $"[AVPLAYER][INFO] end_of_stream handle=0x{player.Handle:X16} " +
+            $"elapsed_ms={player.PlaybackClock.ElapsedMilliseconds} " +
+            $"duration_ms={player.DurationMilliseconds} " +
+            $"video_ended={player.VideoEnded} audio_ended={player.AudioEnded}");
+        return true;
     }
 
     [SysAbiExport(
@@ -473,11 +568,34 @@ public static class AvPlayerExports
         LibraryName = "libSceAvPlayer")]
     public static int AvPlayerGetAudioData(CpuContext ctx)
     {
+        PlayerState? endedPlayer = null;
+        var result = GetAudioDataLocked(ctx, ref endedPlayer);
+        if (endedPlayer is not null)
+        {
+            NotifyEvent(ctx, endedPlayer, 1); // StateStop at end of stream
+        }
+
+        return result;
+    }
+
+    private static int GetAudioDataLocked(CpuContext ctx, ref PlayerState? endedPlayer)
+    {
         var infoAddress = ctx[CpuRegister.Rsi];
         lock (StateGate)
         {
-            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
-                infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
+            {
+                return SetReturn(ctx, 0);
+            }
+
+            player.LastPumpTimestamp = Stopwatch.GetTimestamp();
+            if (ReachedEndOfStreamLocked(player))
+            {
+                endedPlayer = player;
+                return SetReturn(ctx, 0);
+            }
+
+            if (infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
                 player.SourcePath is null || !EnsureAudioDecoder(player))
             {
                 return SetReturn(ctx, 0);
@@ -490,6 +608,14 @@ public static class AvPlayerExports
             if (player.RawAudioFrame is null ||
                 !ReadExactly(player.AudioDecoderOutput, player.RawAudioFrame))
             {
+                // Audio pipe drained (or decoder never produced a frame
+                // buffer). Mark the stream ended so the natural content end
+                // can fire once video is done too.
+                player.AudioEnded = true;
+                if (ReachedEndOfStreamLocked(player))
+                {
+                    endedPlayer = player;
+                }
                 return SetReturn(ctx, 0);
             }
             if (player.AudioBufferBase == 0)
@@ -515,6 +641,7 @@ public static class AvPlayerExports
 
             var timestamp = checked((ulong)(player.NextAudioFrameIndex * samplesPerFrame * 1000L / sampleRate));
             player.NextAudioFrameIndex++;
+            player.DeliveredAudioMilliseconds = (long)timestamp;
             Span<byte> info = stackalloc byte[FrameInfoSize];
             info.Clear();
             BinaryPrimitives.WriteUInt64LittleEndian(info[0..], bufferAddress);
@@ -526,7 +653,9 @@ public static class AvPlayerExports
             {
                 return SetReturn(ctx, 0);
             }
-            Trace($"audio_frame handle=0x{player.Handle:X16} ts={timestamp} data=0x{bufferAddress:X16}");
+            Trace($"audio_frame handle=0x{player.Handle:X16} ts={timestamp} data=0x{bufferAddress:X16} guest_thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} {DescribeGuestCallChain(ctx)}");
+            TryDumpMediaPumpCode(ctx);
+            TryLocateMediaPumpObject(ctx, timestamp);
             return SetReturn(ctx, 1);
         }
     }
@@ -545,7 +674,22 @@ public static class AvPlayerExports
                 return SetReturn(ctx, InvalidParameters);
             }
 
-            var milliseconds = (ulong)player.PlaybackClock.ElapsedMilliseconds;
+            // Hardware AvPlayer reports the PRESENTATION position here — in
+            // audio-master sync (GTA SA:DE uses mode=1) that is the timestamp
+            // of the audio actually handed to the title, not wall time; the
+            // previous wall-clock answer could race ~16s ahead of the ~0.5s
+            // of delivered samples. Semantic correction only: A/B rolls show
+            // the intro-movie wedge rate unchanged (1/5 good either way).
+            // Fall back to the wall clock for streams that never delivered
+            // audio (video-only sources).
+            //
+            // Deliberately NO end-of-stream evaluation here: measured runs
+            // wedge at a coin-flip rate with or without it, and posting
+            // STATE_STOP from a bare clock poll is semantically risky;
+            // end-of-stream fires from GetVideoData/GetAudioData/IsActive.
+            var milliseconds = player.DeliveredAudioMilliseconds > 0
+                ? (ulong)player.DeliveredAudioMilliseconds
+                : (ulong)player.PlaybackClock.ElapsedMilliseconds;
             ctx[CpuRegister.Rax] = milliseconds;
             return unchecked((int)milliseconds);
         }
@@ -584,6 +728,43 @@ public static class AvPlayerExports
         }
 
         previous?.Dispose();
+    }
+
+    internal static void StartPlayerForTest(ulong handle, bool looping = false)
+    {
+        lock (StateGate)
+        {
+            if (Players.TryGetValue(handle, out var player))
+            {
+                player.SourcePath = "test-source";
+                player.Looping = looping;
+                player.Started = true;
+                player.PlaybackClock.Start();
+            }
+        }
+    }
+
+    internal static void MarkStreamsEndedForTest(ulong handle)
+    {
+        lock (StateGate)
+        {
+            if (Players.TryGetValue(handle, out var player))
+            {
+                player.VideoEnded = true;
+                player.AudioEnded = true;
+            }
+        }
+    }
+
+    internal static void SetDeliveredAudioForTest(ulong handle, long milliseconds)
+    {
+        lock (StateGate)
+        {
+            if (Players.TryGetValue(handle, out var player))
+            {
+                player.DeliveredAudioMilliseconds = milliseconds;
+            }
+        }
     }
 
     internal static void RemovePlayerForTest(ulong handle)
@@ -667,6 +848,10 @@ public static class AvPlayerExports
             player.FramesPerSecond = fps;
             player.DurationMilliseconds = duration;
             player.Started = player.AutoStart;
+            if (player.Started)
+            {
+                player.PlaybackClock.Start();
+            }
             autoStart = player.AutoStart;
             Trace($"source guest='{guestPath}' host='{hostPath}' {width}x{height} fps={fps:F3} duration_ms={duration} auto_start={player.AutoStart}");
         }
@@ -682,11 +867,34 @@ public static class AvPlayerExports
 
     private static int GetVideoData(CpuContext ctx, bool extended)
     {
+        PlayerState? endedPlayer = null;
+        var result = GetVideoDataLocked(ctx, extended, ref endedPlayer);
+        if (endedPlayer is not null)
+        {
+            NotifyEvent(ctx, endedPlayer, 1); // StateStop at end of stream
+        }
+
+        return result;
+    }
+
+    private static int GetVideoDataLocked(CpuContext ctx, bool extended, ref PlayerState? endedPlayer)
+    {
         var infoAddress = ctx[CpuRegister.Rsi];
         lock (StateGate)
         {
-            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player) ||
-                infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
+            if (!Players.TryGetValue(ctx[CpuRegister.Rdi], out var player))
+            {
+                return SetReturn(ctx, 0);
+            }
+
+            player.LastPumpTimestamp = Stopwatch.GetTimestamp();
+            if (ReachedEndOfStreamLocked(player))
+            {
+                endedPlayer = player;
+                return SetReturn(ctx, 0);
+            }
+
+            if (infoAddress == 0 || !player.Started || player.Paused || player.EndOfStream ||
                 player.SourcePath is null)
             {
                 return SetReturn(ctx, 0);
@@ -694,7 +902,11 @@ public static class AvPlayerExports
 
             if (!EnsureDecoder(player))
             {
-                player.EndOfStream = true;
+                player.VideoEnded = true;
+                if (ReachedEndOfStreamLocked(player))
+                {
+                    endedPlayer = player;
+                }
                 return SetReturn(ctx, 0);
             }
 
@@ -704,14 +916,14 @@ public static class AvPlayerExports
             {
                 if (!ReadFrame(player))
                 {
-                    return FinishStream(ctx, player);
+                    return FinishStream(ctx, player, ref endedPlayer);
                 }
                 player.NextFrameIndex++;
             }
 
             if (!ReadFrame(player))
             {
-                return FinishStream(ctx, player);
+                return FinishStream(ctx, player, ref endedPlayer);
             }
 
             var timestamp = checked((ulong)Math.Round(player.NextFrameIndex * 1000.0 / fps));
@@ -726,17 +938,15 @@ public static class AvPlayerExports
         }
     }
 
-    private static int FinishStream(CpuContext ctx, PlayerState player)
+    private static int FinishStream(CpuContext ctx, PlayerState player, ref PlayerState? endedPlayer)
     {
-        if (player.Looping)
+        // Video pipe drained. The player as a whole ends only once every
+        // consumed stream has (ReachedEndOfStreamLocked also owns the
+        // looping reset), so a still-draining audio track keeps playing.
+        player.VideoEnded = true;
+        if (ReachedEndOfStreamLocked(player))
         {
-            player.ResetPlayback();
-            player.Started = true;
-        }
-        else
-        {
-            player.EndOfStream = true;
-            player.PlaybackClock.Stop();
+            endedPlayer = player;
         }
         return SetReturn(ctx, 0);
     }
@@ -1557,6 +1767,18 @@ public static class AvPlayerExports
             return;
         }
 
+        // Unconditional, player-relative timing context. Player state events
+        // are rare (a handful per movie), so logging every one is cheap and
+        // lets a good-vs-wedged diff line up the exact event sequence against
+        // the media-clock freeze time (the internal facade clock is fed by the
+        // event processor's clock-state writes, so a mistimed or missing event
+        // is the leading wedge suspect).
+        Console.Error.WriteLine(
+            $"[AVPLAYER][INFO] event_post handle=0x{player.Handle:X16} id={eventId} " +
+            $"elapsed_ms={player.PlaybackClock.ElapsedMilliseconds} " +
+            $"delivered_ms={player.DeliveredAudioMilliseconds} " +
+            $"started={player.Started} paused={player.Paused} eos={player.EndOfStream}");
+
         var scheduler = GuestThreadExecution.Scheduler;
         string? error = null;
         if (scheduler is null ||
@@ -1578,11 +1800,116 @@ public static class AvPlayerExports
             return;
         }
 
-        Trace($"event handle=0x{player.Handle:X16} id={eventId} callback=0x{player.EventCallback:X16}");
+        Console.Error.WriteLine(
+            $"[AVPLAYER][INFO] event_done handle=0x{player.Handle:X16} id={eventId} " +
+            $"callback=0x{player.EventCallback:X16}");
     }
 
     private static int AlignUp(int value, int alignment) =>
         checked((value + alignment - 1) & -alignment);
+
+    // Default OFF. Hardware sceAvPlayer is a realtime pipeline that reaches
+    // end-of-stream on its own clock and posts STATE_STOP through the event
+    // callback REGARDLESS of how (or whether) the title keeps pumping frames.
+    // Our HLE only evaluates end-of-stream inside the pump exports, so when a
+    // title's media pump wedges (GTA SA:DE intro stinger: the UE facade's
+    // played-audio clock freezes ~1 s in and the title stops calling every
+    // AvPlayer export) the movie never "ends", STATE_STOP is never posted, and
+    // the boot hangs waiting for a movie that overran its duration long ago.
+    // The watchdog restores the hardware behaviour: once the realtime clock
+    // passes the probed duration AND the title has clearly stopped pumping, it
+    // posts STATE_STOP. Env-gated while it is validated so default behaviour
+    // (and every verified fix) is untouched.
+    internal static readonly bool DeadlineEndOfStreamEnabled =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_AVPLAYER_EOS_WATCHDOG"),
+            "1",
+            StringComparison.Ordinal);
+
+    private static long _lastDeadlineScanTimestamp;
+
+    /// <summary>
+    /// Posts STATE_STOP for any non-looping player that has overrun its probed
+    /// duration while its pump has gone stale (the title stopped calling every
+    /// AvPlayer export — the wedge). Called from a high-frequency, lock-free
+    /// leaf import (gettimeofday) so it runs on a live guest thread with a
+    /// valid context even when no AvPlayer export is being invoked. Healthy
+    /// playback never reaches here: the pump stays fresh and reaches EOS
+    /// through the normal GetAudioData/GetVideoData path first.
+    /// </summary>
+    internal static void PumpDeadlineEndOfStream(CpuContext ctx)
+    {
+        if (!DeadlineEndOfStreamEnabled)
+        {
+            return;
+        }
+
+        // Global throttle: at most once per ~250 ms across all threads. The
+        // scan is cheap but this import fires millions of times per second.
+        var now = Stopwatch.GetTimestamp();
+        var previous = Volatile.Read(ref _lastDeadlineScanTimestamp);
+        var throttleTicks = Stopwatch.Frequency / 4;
+        if (now - previous < throttleTicks ||
+            Interlocked.CompareExchange(ref _lastDeadlineScanTimestamp, now, previous) != previous)
+        {
+            return;
+        }
+
+        // Duration margin: only intervene well past the natural end so a
+        // healthy-but-slightly-slow pump is never cut short. Pump-stale margin:
+        // the title must have stopped pulling frames for this long.
+        const long durationMarginMs = 1000;
+        const long pumpStaleMs = 500;
+        var pumpStaleTicks = Stopwatch.Frequency * pumpStaleMs / 1000;
+
+        List<PlayerState>? ended = null;
+        lock (StateGate)
+        {
+            foreach (var player in Players.Values)
+            {
+                if (!player.Started || player.Paused || player.EndOfStream ||
+                    player.Looping || player.SourcePath is null ||
+                    player.DurationMilliseconds == 0)
+                {
+                    continue;
+                }
+
+                if ((ulong)player.PlaybackClock.ElapsedMilliseconds <
+                    player.DurationMilliseconds + (ulong)durationMarginMs)
+                {
+                    continue;
+                }
+
+                if (now - player.LastPumpTimestamp < pumpStaleTicks)
+                {
+                    // Pump is still fresh — a healthy stream that will reach
+                    // EOS on its own. Leave it alone.
+                    continue;
+                }
+
+                player.EndOfStream = true;
+                player.PlaybackClock.Stop();
+                Console.Error.WriteLine(
+                    $"[AVPLAYER][INFO] deadline_eos handle=0x{player.Handle:X16} " +
+                    $"elapsed_ms={player.PlaybackClock.ElapsedMilliseconds} " +
+                    $"duration_ms={player.DurationMilliseconds} " +
+                    $"pump_stale_ms={Stopwatch.GetElapsedTime(player.LastPumpTimestamp, now).TotalMilliseconds:F0}");
+                (ended ??= new List<PlayerState>()).Add(player);
+            }
+        }
+
+        if (ended is null)
+        {
+            return;
+        }
+
+        // Guest event callbacks re-enter AvPlayer exports; never post while
+        // holding StateGate.
+        foreach (var player in ended)
+        {
+            NotifyEvent(ctx, player, 1); // StateStop at deadline end of stream
+        }
+    }
 
     private static int ValidatePlayer(CpuContext ctx)
     {
@@ -1604,6 +1931,232 @@ public static class AvPlayerExports
         if (count <= 32 || count % 300 == 0)
         {
             Console.Error.WriteLine($"[AVPLAYER][INFO] {message}");
+        }
+    }
+
+    /// <summary>
+    /// Wedge diagnostic: the guest call site of the current import plus a
+    /// shallow scan up the caller's stack for text-segment return addresses.
+    /// Identifies which engine function drives the media pump so the fetch
+    /// gate can be studied at a concrete address.
+    /// </summary>
+    private static string DescribeGuestCallChain(CpuContext ctx)
+    {
+        if (!GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame))
+        {
+            return "ret=<none>";
+        }
+
+        var chain = new StringBuilder();
+        chain.Append(CultureInfo.InvariantCulture, $"ret=0x{frame.ReturnRip:X}");
+
+        // Scan a bounded window above the resume RSP for plausible code
+        // addresses (module text lives at 0x8xxxxxxxx). Heuristic — frame
+        // layouts vary — but repeated across many calls the stable entries
+        // are the real return chain.
+        Span<byte> slot = stackalloc byte[sizeof(ulong)];
+        var found = 0;
+        for (ulong offset = 0; offset < 0x300 && found < 6; offset += 8)
+        {
+            if (!ctx.Memory.TryRead(frame.ResumeRsp + offset, slot))
+            {
+                break;
+            }
+
+            var value = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+            if (value is > 0x8_0000_0000 and < 0x8_8000_0000)
+            {
+                chain.Append(CultureInfo.InvariantCulture, $" +0x{offset:X}:0x{value:X}");
+                found++;
+            }
+        }
+
+        return chain.ToString();
+    }
+
+    private static int _pumpCodeDumped;
+
+    /// <summary>
+    /// Live address of the engine's media pump object (rbx of the recovered
+    /// TickAudio at guest 0x801B0ED80), found by signature scan of the fetch
+    /// call frame: [obj+0x30] = sample sink whose +0x38 holds the last
+    /// delivered timestamp in 100ns ticks, [obj+0x60] = rate float,
+    /// [obj+0x68] = clock base. Diagnostic only (SHARPEMU_PROBE_MEDIA_CLOCK).
+    /// AudioOut2's push cadence reads it so the clock words stay observable
+    /// even when the title stops calling AvPlayer (the wedge state).
+    /// </summary>
+    internal static ulong MediaPumpProbeObject;
+
+    internal static readonly bool MediaClockProbeEnabled =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_PROBE_MEDIA_CLOCK"),
+            "1",
+            StringComparison.Ordinal);
+
+    private static void TryLocateMediaPumpObject(CpuContext ctx, ulong lastDeliveredMilliseconds)
+    {
+        // ts=0/21 frames make the signature non-distinctive (everything
+        // zero-ish matches); wait for a few frames so sink_ticks is unique.
+        if (!MediaClockProbeEnabled ||
+            MediaPumpProbeObject != 0 ||
+            lastDeliveredMilliseconds < 80 ||
+            !GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame))
+        {
+            return;
+        }
+
+        Span<byte> slot = stackalloc byte[sizeof(ulong)];
+        var expectedTicks = lastDeliveredMilliseconds * 10000;
+        for (ulong offset = 0; offset <= 0x60; offset += 8)
+        {
+            if (!ctx.Memory.TryRead(frame.ResumeRsp + offset, slot))
+            {
+                return;
+            }
+
+            var candidate = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+            if (candidate < 0x10000 ||
+                !ctx.Memory.TryRead(candidate + 0x30, slot))
+            {
+                continue;
+            }
+
+            var sink = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+            if (sink < 0x10000 ||
+                !ctx.Memory.TryRead(sink + 0x38, slot))
+            {
+                continue;
+            }
+
+            var sinkTicks = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+            // The sink records the previous frame's 100ns timestamp; accept
+            // one frame of slack on either side, and the rate float at
+            // +0x60 must be a plausible playback rate (1.0 in practice).
+            if (sinkTicks + 220_000 < expectedTicks ||
+                sinkTicks > expectedTicks + 220_000 ||
+                sinkTicks == 0 ||
+                !ctx.Memory.TryRead(candidate + 0x60, slot[..4]))
+            {
+                continue;
+            }
+
+            var rate = BitConverter.ToSingle(slot[..4]);
+            if (rate is < 0.25f or > 8.0f)
+            {
+                continue;
+            }
+
+            MediaPumpProbeObject = candidate;
+            Console.Error.WriteLine(
+                $"[AVPLAYER][INFO] media_pump_obj=0x{candidate:X} sink=0x{sink:X} " +
+                $"frame_offset=0x{offset:X} sink_ticks={sinkTicks} rate={rate:F2}");
+            return;
+        }
+    }
+
+    /// <summary>
+    /// Reads the pump object's gate words for the periodic clock probe.
+    /// Returns null when the probe is off or the object is not located yet.
+    /// </summary>
+    internal static string? DescribeMediaClock(CpuContext ctx)
+    {
+        var obj = MediaPumpProbeObject;
+        if (obj == 0)
+        {
+            return null;
+        }
+
+        Span<byte> buffer = stackalloc byte[16];
+        if (!ctx.Memory.TryRead(obj + 0x60, buffer))
+        {
+            return "clock=<unreadable>";
+        }
+
+        var rate = BitConverter.ToSingle(buffer[..4]);
+        var clockBase = BinaryPrimitives.ReadInt64LittleEndian(buffer[8..]);
+        var sinkText = "sink=<none>";
+        if (ctx.Memory.TryRead(obj + 0x30, buffer[..8]))
+        {
+            var sink = BinaryPrimitives.ReadUInt64LittleEndian(buffer[..8]);
+            if (sink >= 0x10000 && ctx.Memory.TryRead(sink + 0x38, buffer))
+            {
+                var lastTicks = BinaryPrimitives.ReadInt64LittleEndian(buffer[..8]);
+                var flag = 0;
+                Span<byte> one = stackalloc byte[1];
+                if (ctx.Memory.TryRead(sink + 0x60, one))
+                {
+                    flag = one[0];
+                }
+
+                sinkText = $"sink_last_ticks={lastTicks} sink_flag={flag}";
+            }
+        }
+
+        return $"rate={rate:F2} clock_base_ticks={clockBase} {sinkText}";
+    }
+
+    /// <summary>
+    /// One-shot live-code capture around the media pump call chain, gated by
+    /// SHARPEMU_DUMP_MEDIA_PUMP_CODE=1. Static disassembly of this title's
+    /// hot text diverges from what actually executes, so correctness work on
+    /// the pump gate needs the bytes the CPU really runs. Local diagnostic
+    /// output only.
+    /// </summary>
+    private static void TryDumpMediaPumpCode(CpuContext ctx)
+    {
+        if (_pumpCodeDumped != 0 ||
+            !string.Equals(
+                Environment.GetEnvironmentVariable("SHARPEMU_DUMP_MEDIA_PUMP_CODE"),
+                "1",
+                StringComparison.Ordinal) ||
+            !GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame) ||
+            Interlocked.Exchange(ref _pumpCodeDumped, 1) != 0)
+        {
+            return;
+        }
+
+        Span<byte> slot = stackalloc byte[sizeof(ulong)];
+        var targets = new List<ulong> { frame.ReturnRip };
+        for (ulong offset = 0; offset < 0x300 && targets.Count < 3; offset += 8)
+        {
+            if (!ctx.Memory.TryRead(frame.ResumeRsp + offset, slot))
+            {
+                break;
+            }
+
+            var value = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+            if (value is > 0x8_0000_0000 and < 0x8_8000_0000 &&
+                !targets.Exists(t => value - (t & ~0xFFFUL) < 0x8000))
+            {
+                targets.Add(value);
+            }
+        }
+
+        foreach (var target in targets)
+        {
+            var start = (target & ~0xFFFUL) - 0x4000;
+            var buffer = new byte[0x8000];
+            var readable = 0;
+            for (var page = 0; page < buffer.Length; page += 0x1000)
+            {
+                if (ctx.Memory.TryRead(start + (ulong)page, buffer.AsSpan(page, 0x1000)))
+                {
+                    readable += 0x1000;
+                }
+            }
+
+            var path = Path.Combine("artifacts", $"media-pump-code-0x{start:X}.bin");
+            try
+            {
+                Directory.CreateDirectory("artifacts");
+                File.WriteAllBytes(path, buffer);
+                Console.Error.WriteLine(
+                    $"[AVPLAYER][INFO] pump_code_dump base=0x{start:X} bytes=0x{buffer.Length:X} readable=0x{readable:X} file={path}");
+            }
+            catch (IOException)
+            {
+                // Diagnostic only; never disturb playback on failure.
+            }
         }
     }
 }

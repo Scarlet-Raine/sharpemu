@@ -246,6 +246,7 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int KernelGettimeofday(CpuContext ctx)
     {
+        AvPlayer.AvPlayerExports.PumpDeadlineEndOfStream(ctx);
         var timeAddress = ctx[CpuRegister.Rdi];
         if (timeAddress == 0)
         {
@@ -272,6 +273,7 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int PosixGettimeofday(CpuContext ctx)
     {
+        AvPlayer.AvPlayerExports.PumpDeadlineEndOfStream(ctx);
         var timeAddress = ctx[CpuRegister.Rdi];
         var timezoneAddress = ctx[CpuRegister.Rsi];
         var now = DateTimeOffset.UtcNow;
