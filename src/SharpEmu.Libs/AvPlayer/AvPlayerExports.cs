@@ -2086,6 +2086,17 @@ public static class AvPlayerExports
             ceiling = BinaryPrimitives.ReadInt64LittleEndian(buffer[..8]);
         }
 
+        // The advance block is guarded upstream by `cmp dword [obj+0x64], 3`
+        // (live bytes at guest 0x801B10B72..): the clock only advances while
+        // the media-clock STATE equals 3. This is the word the facade event
+        // processor writes; dump it to separate "state left 3" wedges from
+        // one-shot skip-byte wedges.
+        var state = -1;
+        if (ctx.Memory.TryRead(obj + 0x64, buffer[..4]))
+        {
+            state = BinaryPrimitives.ReadInt32LittleEndian(buffer[..4]);
+        }
+
         var pauseFlag = -1;
         var overrideFlag = -1;
         Span<byte> flag = stackalloc byte[1];
@@ -2116,7 +2127,7 @@ public static class AvPlayerExports
             }
         }
 
-        return $"rate={rate:F2} clock_base_ticks={clockBase} ceiling_ticks={ceiling} " +
+        return $"rate={rate:F2} clock_base_ticks={clockBase} state={state} ceiling_ticks={ceiling} " +
             $"pause={pauseFlag} override={overrideFlag} {sinkText}";
     }
 
