@@ -1731,6 +1731,8 @@ public static class KernelPthreadCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
+        TraceCondSignalChain(ctx, condAddress, broadcast);
+
         if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out _, out var state))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
@@ -2353,8 +2355,36 @@ public static class KernelPthreadCompatExports
     private static void TraceCondWaitChain(CpuContext ctx, ulong condAddress, bool timed, uint timeoutUsec)
     {
         if (!TraceCondChainsEnabled ||
-            (Interlocked.Increment(ref _condChainSampleCounter) & 0xFFF) != 0 ||
-            !GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame))
+            (Interlocked.Increment(ref _condChainSampleCounter) & 0xFFF) != 0)
+        {
+            return;
+        }
+
+        EmitCondChain(ctx, "cond_chain", condAddress, $"timed={timed} usec={timeoutUsec}");
+    }
+
+    private static int _condSignalSampleCounter;
+
+    /// <summary>
+    /// Signal-side sibling: names the PRODUCER threads. In a wedged run the
+    /// hot waiter's condvar either never appears here (waits only ever time
+    /// out — a polling pacer whose real dependency is elsewhere) or its
+    /// signaler chain names the producer that stopped.
+    /// </summary>
+    private static void TraceCondSignalChain(CpuContext ctx, ulong condAddress, bool broadcast)
+    {
+        if (!TraceCondChainsEnabled ||
+            (Interlocked.Increment(ref _condSignalSampleCounter) & 0x1FF) != 0)
+        {
+            return;
+        }
+
+        EmitCondChain(ctx, "cond_signal_chain", condAddress, $"broadcast={broadcast}");
+    }
+
+    private static void EmitCondChain(CpuContext ctx, string tag, ulong condAddress, string detail)
+    {
+        if (!GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame))
         {
             return;
         }
@@ -2379,8 +2409,8 @@ public static class KernelPthreadCompatExports
         }
 
         Console.Error.WriteLine(
-            $"[LOADER][TRACE] cond_chain thread=0x{KernelPthreadState.GetCurrentThreadHandle():X16} " +
-            $"cond=0x{condAddress:X16} timed={timed} usec={timeoutUsec} {chain}");
+            $"[LOADER][TRACE] {tag} thread=0x{KernelPthreadState.GetCurrentThreadHandle():X16} " +
+            $"cond=0x{condAddress:X16} {detail} {chain}");
     }
 
     private static bool ShouldTracePthread()
