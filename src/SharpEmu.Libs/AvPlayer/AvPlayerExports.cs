@@ -2074,6 +2074,30 @@ public static class AvPlayerExports
 
         var rate = BitConverter.ToSingle(buffer[..4]);
         var clockBase = BinaryPrimitives.ReadInt64LittleEndian(buffer[8..]);
+
+        // Live-disassembly of the clock writer (guest 0x801B10BCB, captured by
+        // the cdb hw-watchpoint): the wall-delta advance is CLAMPED at the
+        // ceiling [obj+0x40] unless the byte [obj+0xA0] overrides it, and a
+        // peer byte at +0x88 pauses it. Dump the whole gate so a wedged run
+        // shows directly which condition froze the clock.
+        long ceiling = -1;
+        if (ctx.Memory.TryRead(obj + 0x40, buffer[..8]))
+        {
+            ceiling = BinaryPrimitives.ReadInt64LittleEndian(buffer[..8]);
+        }
+
+        var pauseFlag = -1;
+        var overrideFlag = -1;
+        Span<byte> flag = stackalloc byte[1];
+        if (ctx.Memory.TryRead(obj + 0x88, flag))
+        {
+            pauseFlag = flag[0];
+        }
+        if (ctx.Memory.TryRead(obj + 0xA0, flag))
+        {
+            overrideFlag = flag[0];
+        }
+
         var sinkText = "sink=<none>";
         if (ctx.Memory.TryRead(obj + 0x30, buffer[..8]))
         {
@@ -2081,18 +2105,19 @@ public static class AvPlayerExports
             if (sink >= 0x10000 && ctx.Memory.TryRead(sink + 0x38, buffer))
             {
                 var lastTicks = BinaryPrimitives.ReadInt64LittleEndian(buffer[..8]);
-                var flag = 0;
+                var sinkFlag = 0;
                 Span<byte> one = stackalloc byte[1];
                 if (ctx.Memory.TryRead(sink + 0x60, one))
                 {
-                    flag = one[0];
+                    sinkFlag = one[0];
                 }
 
-                sinkText = $"sink_last_ticks={lastTicks} sink_flag={flag}";
+                sinkText = $"sink_last_ticks={lastTicks} sink_flag={sinkFlag}";
             }
         }
 
-        return $"rate={rate:F2} clock_base_ticks={clockBase} {sinkText}";
+        return $"rate={rate:F2} clock_base_ticks={clockBase} ceiling_ticks={ceiling} " +
+            $"pause={pauseFlag} override={overrideFlag} {sinkText}";
     }
 
     /// <summary>
