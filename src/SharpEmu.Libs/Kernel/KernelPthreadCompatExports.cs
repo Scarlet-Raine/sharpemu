@@ -1583,6 +1583,7 @@ public static class KernelPthreadCompatExports
         }
 
         TraceCondWaitChain(ctx, condAddress, timed, timeoutUsec);
+        DumpBridgeCandidate(ctx, condAddress, timed, timeoutUsec);
 
         if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out _, out var state))
         {
@@ -2364,6 +2365,154 @@ public static class KernelPthreadCompatExports
     }
 
     private static int _condSignalSampleCounter;
+
+    // Bridge-object dump: when the RAGE->UE audio bridge wedges, its producer
+    // spins in sub-millisecond pthread_cond_timedwait retries for the rest of
+    // the run (hundreds of thousands of iterations), so counting sub-ms timed
+    // waits per condvar auto-selects the wedged bridge without knowing the
+    // thread. The raw dumps then resolve what static analysis cannot: the
+    // object window around the condvar carries the sibling condvar, the ring
+    // read/write indices, and the consumer vtable pointers, while the raw
+    // guest stack carries the true return chain through the virtual dispatch
+    // that hides the bridge glue from xrefs. Enabled by SHARPEMU_DUMP_BRIDGE=1.
+    private static readonly bool DumpBridgeEnabled =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_DUMP_BRIDGE"),
+            "1",
+            StringComparison.Ordinal);
+
+    private static readonly ConcurrentDictionary<ulong, long> _bridgeWaitCounts = new();
+    private static int _bridgeDumpsEmitted;
+    private static bool _bridgeWedgeConfirmed;
+    private static readonly ConcurrentDictionary<ulong, byte> _bridgeUntimedSeen = new();
+    private static int _bridgeUntimedDumps;
+    private static int _bridgeExtrasEmitted;
+
+    private static void DumpBridgeCandidate(CpuContext ctx, ulong condAddress, bool timed, uint timeoutUsec)
+    {
+        if (!DumpBridgeEnabled)
+        {
+            return;
+        }
+
+        if (!timed)
+        {
+            // Once the wedge is confirmed, catch parked consumers as the
+            // force-wake timer spuriously wakes them and they RE-ENTER their
+            // untimed wait: one dump per condvar reads the predicate object
+            // the consumer just re-checked and found false.
+            if (!Volatile.Read(ref _bridgeWedgeConfirmed) ||
+                !_bridgeUntimedSeen.TryAdd(condAddress, 0) ||
+                Interlocked.Increment(ref _bridgeUntimedDumps) > 16)
+            {
+                return;
+            }
+
+            EmitBridgeDump(ctx, "UNTIMED", condAddress, 0, 0);
+            return;
+        }
+
+        if (timeoutUsec >= 1000)
+        {
+            return;
+        }
+
+        var waits = _bridgeWaitCounts.AddOrUpdate(condAddress, 1, static (_, count) => count + 1);
+        // Thresholds deep inside the wedge; ordinary startup pacing never
+        // accumulates this many sub-ms retries on one condvar.
+        if (waits != (1L << 17) && waits != (1L << 18) && waits != (1L << 19))
+        {
+            return;
+        }
+
+        if (Interlocked.Increment(ref _bridgeDumpsEmitted) > 8)
+        {
+            return;
+        }
+
+        Volatile.Write(ref _bridgeWedgeConfirmed, true);
+        EmitBridgeDump(ctx, "POLLER", condAddress, waits, timeoutUsec);
+        EmitBridgeExtras(ctx);
+    }
+
+    private static readonly object _bridgeDumpGate = new();
+
+    private static void EmitBridgeDump(CpuContext ctx, string kind, ulong condAddress, long waits, uint timeoutUsec)
+    {
+        // Serialized: concurrent force-woken waiters otherwise interleave the
+        // multi-line windows and make attribution impossible.
+        lock (_bridgeDumpGate)
+        {
+            Console.Error.WriteLine(
+                $"[BRIDGE][DUMP] kind={kind} cond=0x{condAddress:X16} " +
+                $"thread=0x{KernelPthreadState.GetCurrentThreadHandle():X16} " +
+                $"waits={waits} usec={timeoutUsec}");
+            DumpQwordWindow(ctx, "OBJ", condAddress - 0x300, 0x400, condAddress);
+            if (GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame))
+            {
+                Console.Error.WriteLine(
+                    $"[BRIDGE][DUMP] ret=0x{frame.ReturnRip:X} rsp=0x{frame.ResumeRsp:X16}");
+                DumpQwordWindow(ctx, "STK", frame.ResumeRsp, 0x400, frame.ResumeRsp);
+            }
+        }
+    }
+
+    // SHARPEMU_DUMP_BRIDGE_EXTRA: comma-separated guest hex addresses dumped
+    // once (0x80 bytes each) when the wedge is first confirmed. Used to read
+    // load-time-relocated vtables that are all zero in the static eboot.
+    private static void EmitBridgeExtras(CpuContext ctx)
+    {
+        if (Interlocked.Exchange(ref _bridgeExtrasEmitted, 1) != 0)
+        {
+            return;
+        }
+
+        var extras = ParseTraceAddressFilter(
+            Environment.GetEnvironmentVariable("SHARPEMU_DUMP_BRIDGE_EXTRA"));
+        if (extras is null)
+        {
+            return;
+        }
+
+        foreach (var address in extras)
+        {
+            Console.Error.WriteLine($"[BRIDGE][DUMP] kind=EXTRA base=0x{address:X16}");
+            DumpQwordWindow(ctx, "EXT", address, 0x80, address);
+        }
+    }
+
+    private static void DumpQwordWindow(CpuContext ctx, string tag, ulong start, ulong length, ulong baseAddress)
+    {
+        Span<byte> slot = stackalloc byte[sizeof(ulong)];
+        var line = new System.Text.StringBuilder();
+        for (ulong offset = 0; offset < length; offset += 8)
+        {
+            if ((offset & 0x38) == 0)
+            {
+                if (line.Length != 0)
+                {
+                    Console.Error.WriteLine(line.ToString());
+                    line.Clear();
+                }
+
+                var delta = (long)(start + offset) - (long)baseAddress;
+                line.Append(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    $"[BRIDGE][{tag}] {(delta < 0 ? '-' : '+')}0x{Math.Abs(delta):X3}:");
+            }
+
+            line.Append(ctx.Memory.TryRead(start + offset, slot)
+                ? string.Create(
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    $" {BinaryPrimitives.ReadUInt64LittleEndian(slot):X16}")
+                : " ????????????????");
+        }
+
+        if (line.Length != 0)
+        {
+            Console.Error.WriteLine(line.ToString());
+        }
+    }
 
     /// <summary>
     /// Signal-side sibling: names the PRODUCER threads. In a wedged run the
