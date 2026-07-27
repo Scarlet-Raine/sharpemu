@@ -1609,6 +1609,23 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        // RAGE/Scaleform in-memory file device: "memory:$<addr>,<size>,<off>:<name>"
+        // describes an asset already resident in guest memory. There is no host
+        // file — treat it as a regular file of <size> bytes so the guest's asset
+        // loader stops re-probing it (GTA V/SA UI + HUD .gfx load this way).
+        if (TryParseMemoryFilePath(guestPath, out _, out var memoryFileSize))
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (TryWriteKernelStat(ctx, statAddress, isDirectory: false, memoryFileSize, nowUtc, nowUtc, nowUtc, guestPath))
+            {
+                LogUniqueStatTrace(guestPath, "<memory>", found: true);
+                ctx[CpuRegister.Rax] = 0;
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
         var hostPath = ResolveGuestPath(guestPath);
         var statCacheKey = GetNegativeStatCacheKey(guestPath);
         if (statCacheKey is not null && IsNegativeStatCached(statCacheKey))
@@ -4845,6 +4862,45 @@ public static partial class KernelMemoryCompatExports
         }
 
         return FileMode.Open;
+    }
+
+    // Parses the RAGE in-memory file pseudo-path
+    // "memory:$<hexAddr>,<decSize>,<decOffset>:<name>" (e.g.
+    // "memory:$0x14D4060000,101371,0:00158_hud_reticle.gfx"). Only the declared
+    // byte size is needed to satisfy stat; the payload is already resident in
+    // guest memory at <hexAddr>.
+    internal static bool TryParseMemoryFilePath(string guestPath, out ulong address, out long size)
+    {
+        address = 0;
+        size = 0;
+        const string prefix = "memory:$";
+        if (guestPath is null || !guestPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var rest = guestPath.AsSpan(prefix.Length);
+        var firstComma = rest.IndexOf(',');
+        if (firstComma <= 0)
+        {
+            return false;
+        }
+
+        var addressText = rest[..firstComma];
+        if (addressText.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            addressText = addressText[2..];
+        }
+
+        if (!ulong.TryParse(addressText, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out address))
+        {
+            return false;
+        }
+
+        var afterAddress = rest[(firstComma + 1)..];
+        var secondComma = afterAddress.IndexOf(',');
+        var sizeText = secondComma >= 0 ? afterAddress[..secondComma] : afterAddress;
+        return long.TryParse(sizeText, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out size) && size >= 0;
     }
 
     public static string ResolveGuestPath(string guestPath)
