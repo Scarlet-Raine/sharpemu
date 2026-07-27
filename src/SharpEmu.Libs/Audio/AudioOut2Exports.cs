@@ -36,11 +36,17 @@ public static class AudioOut2Exports
             Frequency = frequency == 0 ? 48000 : frequency;
             Channels = channels == 0 ? 2 : channels;
             GrainSamples = grainSamples == 0 ? 256 : grainSamples;
+            Queue = RealtimeQueueEnabled
+                ? new RealtimeAudioQueue(Frequency, GrainSamples, AudioQueueDepth, Stopwatch.Frequency)
+                : null;
         }
 
         public uint Frequency { get; }
         public uint Channels { get; }
         public uint GrainSamples { get; }
+
+        // Realtime grain-queue model (null unless SHARPEMU_AUDIO_REALTIME_QUEUE=1).
+        public RealtimeAudioQueue? Queue { get; }
 
         // Blocks the advancing thread until one grain worth of wall-clock time
         // has elapsed since the previous advance, matching hardware timing so
@@ -205,6 +211,49 @@ public static class AudioOut2Exports
             TraceAudioOut2($"context-push count={traceCount} rdi=0x{handle:X} rsi=0x{ctx[CpuRegister.Rsi]:X} rdx=0x{ctx[CpuRegister.Rdx]:X} rcx=0x{ctx[CpuRegister.Rcx]:X}");
         }
 
+        // Hardware behaviour (validated against the KytyPS5 reference and the
+        // observed guest ABI — rsi is the blocking flag, and GTA SA:DE always
+        // pushes with blocking=1): sceAudioOut2ContextPush blocks until the DAC
+        // has drained a grain, and that back-pressure is what paces the mixer
+        // render thread to the audio clock. When the realtime model is enabled
+        // we honour the blocking contract, yielding to the cooperative scheduler
+        // and using the high-resolution host sleep (which avoids the Windows
+        // ~15.6 ms sleep-granularity cliff the in-push pace was written to dodge).
+        if (RealtimeQueueEnabled && Contexts.TryGetValue(handle, out var realtimeContext) &&
+            realtimeContext.Queue is { } queue)
+        {
+            var blocking = ctx[CpuRegister.Rsi] != 0;
+            var attempts = 0;
+            while (!queue.TryEnqueue(Stopwatch.GetTimestamp(), out var waitTicks))
+            {
+                if (!blocking)
+                {
+                    return SetReturn(ctx, AudioOut2ErrorNotReady);
+                }
+
+                GuestThreadExecution.Scheduler?.Pump(ctx, "sceAudioOut2ContextPush");
+                var waitMicros = waitTicks * 1_000_000L / Stopwatch.Frequency;
+                if (waitMicros < 1L)
+                {
+                    waitMicros = 1L;
+                }
+                else if (waitMicros > MaxPushWaitMicros)
+                {
+                    waitMicros = MaxPushWaitMicros;
+                }
+
+                HostTiming.SleepMicroseconds(waitMicros);
+
+                if (++attempts >= MaxPushWaitAttempts)
+                {
+                    // Safety valve: never let a modelling error hang a push.
+                    break;
+                }
+            }
+
+            return SetReturn(ctx, 0);
+        }
+
         if (Contexts.TryGetValue(handle, out var context))
         {
             // FMOD's PS5 output path uses ContextPush as the submission clock
@@ -214,6 +263,36 @@ public static class AudioOut2Exports
         }
 
         return SetReturn(ctx, 0);
+    }
+
+    // Queue depth reported to the guest as "available grains" by the realtime
+    // model. Default 2 matches hardware double-buffering (verified against the
+    // KytyPS5 reference decode of the guest context-param blob); override for
+    // debugging with SHARPEMU_AUDIO_QUEUE_DEPTH.
+    private static readonly uint AudioQueueDepth = GetAudioQueueDepth();
+
+    // When enabled, Push/GetQueueLevel model a realtime-draining grain queue so
+    // the guest audio mixer self-paces to the DAC clock instead of free-running
+    // against a synchronously-paced queue. Default OFF preserves the legacy
+    // in-push pacing until the model has soaked across titles.
+    private static readonly bool RealtimeQueueEnabled =
+        Environment.GetEnvironmentVariable("SHARPEMU_AUDIO_REALTIME_QUEUE") == "1";
+
+    // sceAudioOut2 error returned by a non-blocking push when the queue is full.
+    private const int AudioOut2ErrorNotReady = unchecked((int)0x80268008);
+    // Bounds on the blocking-push pace so a modelling error can never hang a push.
+    private const long MaxPushWaitMicros = 20_000;
+    private const int MaxPushWaitAttempts = 16;
+
+    private static uint GetAudioQueueDepth()
+    {
+        var raw = Environment.GetEnvironmentVariable("SHARPEMU_AUDIO_QUEUE_DEPTH");
+        if (uint.TryParse(raw, out var depth) && depth is >= 1 and <= 16)
+        {
+            return depth;
+        }
+
+        return 2;
     }
 
     [SysAbiExport(
@@ -240,8 +319,24 @@ public static class AudioOut2Exports
         LibraryName = "libSceAudioOut2")]
     public static int AudioOut2ContextGetQueueLevel(CpuContext ctx)
     {
-        // The advance path paces synchronously, so the queue is always drained.
+        // Default: the advance path paces synchronously, so the queue is always
+        // drained. With SHARPEMU_AUDIO_REALTIME_QUEUE the values instead track
+        // the realtime-draining model so the mixer paces itself to the DAC
+        // clock (see RealtimeAudioQueue).
         var levelAddress = ctx[CpuRegister.Rsi];
+        if (RealtimeQueueEnabled &&
+            Contexts.TryGetValue(ctx[CpuRegister.Rdi], out var context) &&
+            context.Queue is { } queue)
+        {
+            queue.Sample(Stopwatch.GetTimestamp(), out var levelValue, out _);
+            if (levelAddress != 0)
+            {
+                _ = TryWriteUInt64(ctx, levelAddress, levelValue);
+            }
+
+            return SetReturn(ctx, 0);
+        }
+
         if (levelAddress != 0)
         {
             _ = TryWriteUInt64(ctx, levelAddress, 0);
