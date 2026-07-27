@@ -403,6 +403,28 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private long _importLoopPatternStartTimestamp;
 
+	private int _importLoopThrottleLogCount;
+
+	// Per-thread NID streak: tracks consecutive same-NID calls per host
+	// thread.  Each guest thread runs on a fixed host thread (main thread on
+	// the host thread, guest workers on GuestExecutionRunner threads), so
+	// [ThreadStatic] gives per-guest-thread tracking with zero contention.
+	// Unlike the shared signature buffer (which is diluted by imports from
+	// other threads), per-thread counters are immune to cross-thread
+	// interleaving and reliably detect a single thread's busy-poll loop
+	// (e.g. the main thread's scePthreadGetthreadid storm during a UE4
+	// task-graph drain wedge).
+	[ThreadStatic] private static ulong _tlsNidStreakNidHash;
+	[ThreadStatic] private static long _tlsNidStreakCount;
+	[ThreadStatic] private static long _tlsNidStreakStartTimestamp;
+
+	// Per-thread import rate: detects a thread dispatching imports at a
+	// sustained high rate (>200K/s for 5 s).  This catches busy-poll loops
+	// that call MULTIPLE different NIDs (gettimeofday + scePthreadGetthreadid
+	// + scePthreadMutexLock) where the single-NID streak never accumulates.
+	[ThreadStatic] private static long _tlsImportRateCount;
+	[ThreadStatic] private static long _tlsImportRateWindowStart;
+	private int _nidStreakThrottleLogCount;
 
 	private enum GuestThreadRunState
 	{
@@ -461,6 +483,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		public IGuestThreadBlockWaiter? BlockWaiter { get; set; }
 
 		public long BlockDeadlineTimestamp { get; set; }
+
+		/// <summary>
+		/// Timestamp when the thread entered the Blocked state. Used by the
+		/// ready-dispatch background thread to detect cooperatively blocked
+		/// threads that have been waiting for an unusually long time, which
+		/// may indicate a deadlock with a spinning main thread.
+		/// </summary>
+		public long BlockedSinceTimestamp { get; set; }
 
 		public long ImportCount;
 
@@ -605,9 +635,77 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		private readonly Thread _thread;
 		private Action? _work;
 		private volatile bool _stopping;
+		private readonly int _startupDelayMs;
+		private bool _firstWork = true;
+
+		// Cooperative-scheduler hand-off experiment (default OFF). Session-11
+		// profiling measured WaitHandle.WaitOne at ~57.6% of all CPU: a parked
+		// guest pthread pays a full kernel event round-trip on every wake, and
+		// producer/consumer hand-offs (condvar signal -> runnable slice) are
+		// often imminent. Spinning a bounded budget on a non-blocking poll
+		// before parking catches those imminent wakes without the syscall.
+		// Env-gated while validated so default behaviour is untouched.
+		private static readonly bool SpinBeforePark =
+			string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_GUEST_SPIN_BEFORE_PARK"),
+				"1",
+				StringComparison.Ordinal);
+
+		private static readonly int SpinIterations = ResolveSpinIterations();
+
+		// Audio mixer startup delay: prevents the UE AudioMixerRenderThread from
+		// executing its first render callback before the game's main thread has
+		// registered audio sources.  Without this, the mixer sees an empty source
+		// on its first pass, virtualizes it, and the main thread deadlocks polling
+		// for FIFO space that is never drained.  Env-gated (default OFF) while
+		// validated across multiple titles.
+		private static readonly int AudioMixerStartupDelayMs = ResolveAudioMixerStartupDelay();
+
+		private static int ResolveAudioMixerStartupDelay()
+		{
+			var raw = Environment.GetEnvironmentVariable("SHARPEMU_AUDIO_MIXER_STARTUP_DELAY_MS");
+			return int.TryParse(raw, out var value) && value is > 0 and <= 5000
+				? value
+				: 0;
+		}
+
+		private static int ResolveSpinIterations()
+		{
+			var raw = Environment.GetEnvironmentVariable("SHARPEMU_GUEST_SPIN_ITERS");
+			return int.TryParse(raw, out var value) && value is > 0 and <= 100_000
+				? value
+				: 400;
+		}
+
+		private void WaitForWorkAvailable()
+		{
+			// Bounded adaptive spin: poll the signal without blocking, spinning
+			// the CPU briefly between polls. AutoResetEvent.WaitOne(0) consumes
+			// the signal exactly like the blocking WaitOne, so no wake is lost
+			// and Dispose's Set() is still observed (then _stopping is checked
+			// by the caller). Falls back to a real kernel wait after the budget.
+			if (SpinBeforePark)
+			{
+				for (var i = 0; i < SpinIterations; i++)
+				{
+					if (_workAvailable.WaitOne(0))
+					{
+						return;
+					}
+
+					Thread.SpinWait(64);
+				}
+			}
+
+			_workAvailable.WaitOne();
+		}
 
 		public GuestExecutionRunner(ulong guestThreadHandle, string name, ThreadPriority priority)
 		{
+			_startupDelayMs = AudioMixerStartupDelayMs > 0 &&
+				name.Contains("AudioMixerRenderThread", StringComparison.Ordinal)
+				? AudioMixerStartupDelayMs
+				: 0;
 			_thread = new Thread(() => ThreadMain(guestThreadHandle))
 			{
 				IsBackground = true,
@@ -641,7 +739,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			{
 				while (true)
 				{
-					_workAvailable.WaitOne();
+					WaitForWorkAvailable();
 					if (_stopping)
 					{
 						return;
@@ -653,6 +751,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						work = _work;
 						_work = null;
 					}
+
+					if (_firstWork)
+					{
+						_firstWork = false;
+						if (_startupDelayMs > 0)
+						{
+							Thread.Sleep(_startupDelayMs);
+						}
+					}
+
 					work?.Invoke();
 				}
 			}
@@ -2927,7 +3035,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int hostPauseJump = offset;
 		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4C);
+		// REX.B must be set (0x4D) so the CAS targets [r9] like the rest of the
+		// lock sequence; 0x4C encoded [rcx], so the acquire CAS hit stack garbage
+		// and could spin forever on a free lock (movie-decode VEH entry freeze).
+		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4D);
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11); // lock cmpxchg [r9], r10
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int hostRetryJump = offset;
@@ -3010,7 +3121,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int guestPauseJump = offset;
 		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4C);
+		// Same REX.B fix as the host-path acquire above: CAS must hit [r9].
+		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4D);
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11);
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int guestRetryJump = offset;
@@ -3844,6 +3956,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				thread.State = GuestThreadRunState.Ready;
 				thread.BlockReason = null;
 				thread.BlockDeadlineTimestamp = 0;
+				thread.BlockedSinceTimestamp = 0;
 				_readyGuestThreads.Enqueue(thread);
 				Interlocked.Increment(ref _readyGuestThreadCount);
 				wakeCount++;
@@ -3940,6 +4053,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				thread.State = GuestThreadRunState.Ready;
 				thread.BlockReason = null;
 				thread.BlockDeadlineTimestamp = 0;
+				thread.BlockedSinceTimestamp = 0;
 				_readyGuestThreads.Enqueue(thread);
 				Interlocked.Increment(ref _readyGuestThreadCount);
 				wakeCount++;
@@ -3988,7 +4102,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						$"[LOADER][TRACE] guest_thread.idle_wait reason={reason} handle=0x{thread.ThreadHandle:X16} " +
 						$"name='{thread.Name}' state={thread.State} imports={Interlocked.Read(ref thread.ImportCount)} " +
 						$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
-						$"block={thread.BlockReason ?? "none"}");
+						$"rdi=0x{Volatile.Read(ref thread.LastImportRdi):X16} block={thread.BlockReason ?? "none"}");
 				}
 
 				nextSnapshotTimestamp = Stopwatch.GetTimestamp() + Stopwatch.Frequency;
@@ -4227,11 +4341,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 				owner.State = GuestThreadRunState.Blocked;
 				owner.BlockReason = callbackReason ?? reason;
+				owner.BlockedSinceTimestamp = Stopwatch.GetTimestamp();
 				if (owner.BlockWaiter is not null && owner.BlockWaiter.TryWake())
 				{
 					owner.State = GuestThreadRunState.Ready;
 					owner.BlockReason = null;
 					owner.BlockDeadlineTimestamp = 0;
+					owner.BlockedSinceTimestamp = 0;
 				}
 			}
 			if (_logGuestThreads)
@@ -5462,6 +5578,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					case GuestNativeCallExitReason.Blocked:
 						thread.State = GuestThreadRunState.Blocked;
 						thread.BlockReason = blockReason;
+						thread.BlockedSinceTimestamp = Stopwatch.GetTimestamp();
 						if (thread.HasBlockedContinuation &&
 							thread.BlockWaiter is not null &&
 							thread.BlockWaiter.TryWake())
@@ -5469,6 +5586,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 							thread.State = GuestThreadRunState.Ready;
 							thread.BlockReason = null;
 							thread.BlockDeadlineTimestamp = 0;
+							thread.BlockedSinceTimestamp = 0;
 							_readyGuestThreads.Enqueue(thread);
 							Interlocked.Increment(ref _readyGuestThreadCount);
 						}
@@ -6527,6 +6645,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			"1",
 			StringComparison.Ordinal);
 		var nextSnapshotTimestamp = Stopwatch.GetTimestamp() + Stopwatch.Frequency;
+		var nextForceWakeTimestamp = Stopwatch.GetTimestamp() + Stopwatch.Frequency * 2;
 		_readyDispatchStop = false;
 		_readyDispatchThread = new Thread(new ThreadStart(delegate
 		{
@@ -6541,6 +6660,21 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				// _guestThreadGate is authoritative. Always attempt a locked drain so a
 				// stale hint cannot strand a runnable continuation.
 				DispatchReadyGuestThreads();
+				// Re-enabled: the game thread's spin loop does NOT always exit on
+				// its own.  When the main thread monopolises the CPU with a
+				// gettimeofday busy-poll (UE4 task-graph drain), the guest
+				// workers it waits on stay blocked on their condvars forever
+				// (~50 % wedge rate on GTA SA:DE).  Force-waking stale blocked
+				// waiters breaks this deadlock.  POSIX permits spurious wakeups;
+				// well-behaved guest code re-checks its predicate and re-blocks.
+				// The 5 s stale threshold inside ForceWakeStaleBlockedGuestThreads
+				// is well above any normal task-graph round-trip.
+				var now = Stopwatch.GetTimestamp();
+				if (now >= nextForceWakeTimestamp)
+				{
+					ForceWakeStaleBlockedGuestThreads(now);
+					nextForceWakeTimestamp = now + Stopwatch.Frequency * 2;
+				}
 				if (logSnapshots && Stopwatch.GetTimestamp() >= nextSnapshotTimestamp)
 				{
 					lock (_guestThreadGate)
@@ -6590,6 +6724,52 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 		}
 		_readyDispatchThread = null;
+	}
+
+	/// <summary>
+	/// Detects cooperatively blocked guest threads that have been waiting for
+	/// an unusually long time (over 5 seconds) and force-wakes their condvar
+	/// waiters. This breaks deadlocks where the main thread spins in a
+	/// leaf-import loop and never reaches the code that signals worker
+	/// threads' condvars. POSIX permits spurious wakeups, so well-behaved
+	/// guest code re-checks its predicate and re-blocks if unsatisfied.
+	/// </summary>
+	private void ForceWakeStaleBlockedGuestThreads(long now)
+	{
+		var forceWake = GuestThreadExecution.ForceWakeBlockedWaiters;
+		if (forceWake is null)
+		{
+			return;
+		}
+
+		var staleThreshold = Stopwatch.Frequency * 2; // 2 seconds
+		var hasStaleBlocked = false;
+		lock (_guestThreadGate)
+		{
+			foreach (var thread in _guestThreads.Values)
+			{
+				if (thread.State == GuestThreadRunState.Blocked &&
+					thread.BlockedSinceTimestamp != 0 &&
+					now - thread.BlockedSinceTimestamp > staleThreshold)
+				{
+					hasStaleBlocked = true;
+					break;
+				}
+			}
+		}
+
+		if (!hasStaleBlocked)
+		{
+			return;
+		}
+
+		var woken = forceWake();
+		if (woken != 0 && _logGuestThreads)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][INFO] guest_threads.force_wake count={woken} " +
+				$"reason=stale_blocked_threshold");
+		}
 	}
 
 	// Dequeue every currently-ready guest thread and start a native thread for
@@ -6686,6 +6866,40 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			ulong rsp = cpuContext[CpuRegister.Rsp];
 			Console.Error.WriteLine($"[LOADER][ERROR] Stall snapshot: rip=0x{cpuContext.Rip:X16} rsp=0x{rsp:X16} rbp=0x{cpuContext[CpuRegister.Rbp]:X16} rax=0x{cpuContext[CpuRegister.Rax]:X16} rbx=0x{cpuContext[CpuRegister.Rbx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} rdi=0x{cpuContext[CpuRegister.Rdi]:X16}");
+			// Allocator cache diagnostic: when the stalled thread is in the
+			// FMallocBinned2 allocator (rax holds the TLS8 per-thread cache),
+			// dump the freelist state for the first few bins and the global pool
+			// CAS slots to determine whether the allocator is starving.
+			{
+				var cachePtr = cpuContext[CpuRegister.Rax];
+				if (cachePtr != 0 && cachePtr > 0x1000000000UL)
+				{
+					var allocSb = new System.Text.StringBuilder();
+					allocSb.Append($"[LOADER][ERROR] Stall allocator cache@0x{cachePtr:X16}:");
+					for (uint bin = 0; bin < 8; bin++)
+					{
+						var entryOff = bin * 32;
+						cpuContext.TryReadUInt64(cachePtr + entryOff, out var flHead);
+						cpuContext.TryReadUInt64(cachePtr + entryOff + 8, out var flCountRaw);
+						cpuContext.TryReadUInt64(cachePtr + entryOff + 0x10, out var poolPtr);
+						allocSb.Append($" bin{bin}=[head=0x{flHead:X16} cnt={flCountRaw & 0xFFFFFFFF} pool=0x{poolPtr:X16}]");
+					}
+					Console.Error.WriteLine(allocSb.ToString());
+					// Global pool CAS slots for bin 0 (size=16): 8 slots at 0x8068850C0.
+					if (cpuContext.TryReadByte(0x806886430UL + 1, out var bin0Idx))
+					{
+						var poolSb = new System.Text.StringBuilder();
+						poolSb.Append($"[LOADER][ERROR] Stall global_pool bin={bin0Idx}:");
+						var poolBase = 0x8068850C0UL + (ulong)(bin0Idx * 64);
+						for (uint slot = 0; slot < 8; slot++)
+						{
+							cpuContext.TryReadUInt64(poolBase + slot * 8, out var slotVal);
+							poolSb.Append($" slot{slot}=0x{slotVal:X16}");
+						}
+						Console.Error.WriteLine(poolSb.ToString());
+					}
+				}
+			}
 			ulong num = cpuContext.Rip & 0xFFFFFFFFFFFFFFF0uL;
 			for (int i = 0; i < _importEntries.Length; i++)
 			{
@@ -6716,6 +6930,56 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			if (rsp != 0 && cpuContext.TryReadUInt64(rsp, out var value) && cpuContext.TryReadUInt64(rsp + 8, out var value2))
 			{
 				Console.Error.WriteLine($"[LOADER][ERROR] Stall stack: [rsp]=0x{value:X16} [rsp+8]=0x{value2:X16}");
+				// Dump the full allocator frame: saved regs + caller return address.
+				// The allocator at 0x801BEF240 pushes 6 regs (48 bytes) + sub rsp,0x18,
+				// so the caller's return address is at [rsp+0x38].
+				var frameSb = new System.Text.StringBuilder();
+				frameSb.Append("[LOADER][ERROR] Stall frame:");
+				for (uint foff = 0; foff <= 0x48; foff += 8)
+				{
+					if (cpuContext.TryReadUInt64(rsp + foff, out var fval))
+						frameSb.Append($" [+0x{foff:X2}]=0x{fval:X16}");
+				}
+				Console.Error.WriteLine(frameSb.ToString());
+			}
+			if (rsp != 0)
+			{
+				// Bounded guest stack scan: report every qword that looks like a
+				// code return address. The emulator records import resume RIPs by a
+				// non-standard rule that can land mid-instruction, so reconstruct the
+				// real call chain from the live stack instead of trusting [rsp].
+				string stackWalk = string.Empty;
+				int stackHits = 0;
+				for (ulong stackOffset = 0; stackOffset < 2048 && stackHits < 32; stackOffset += 8)
+				{
+					if (cpuContext.TryReadUInt64(rsp + stackOffset, out var slot) && IsLikelyReturnAddress(slot))
+					{
+						stackWalk += $" +0x{stackOffset:X3}=0x{slot:X16}";
+						stackHits++;
+					}
+				}
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall stack-walk ({stackHits} code refs):{stackWalk}");
+
+				// Frame-pointer chain walk (valid when the guest keeps rbp frames).
+				string frameWalk = string.Empty;
+				int frameCount = 0;
+				ulong framePointer = cpuContext[CpuRegister.Rbp];
+				var visitedFrames = new HashSet<ulong>();
+				while (framePointer != 0 && frameCount < 24 && visitedFrames.Add(framePointer))
+				{
+					if (!cpuContext.TryReadUInt64(framePointer + 8, out var frameReturn) || !IsLikelyReturnAddress(frameReturn))
+					{
+						break;
+					}
+					frameWalk += $" 0x{frameReturn:X16}";
+					frameCount++;
+					if (!cpuContext.TryReadUInt64(framePointer, out var nextFrame) || nextFrame <= framePointer)
+					{
+						break;
+					}
+					framePointer = nextFrame;
+				}
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall rbp-walk ({frameCount} frames):{frameWalk}");
 			}
 
 			var threads = SnapshotGuestThreads();
@@ -6745,7 +7009,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 						$"rdi=0x{Volatile.Read(ref thread.LastImportRdi):X16} rsi=0x{Volatile.Read(ref thread.LastImportRsi):X16} " +
 						$"rdx=0x{Volatile.Read(ref thread.LastImportRdx):X16} block={thread.BlockReason ?? "none"}{hostContextText}");
 					logged++;
-					if (logged >= 48 && threads.Length > logged)
+					// Late-created threads (audio/media pumps) sort last; the
+					// movie-wedge census needs them, so keep the cap above the
+					// full GTA SA:DE thread count (~62).
+					if (logged >= 96 && threads.Length > logged)
 					{
 						Console.Error.WriteLine($"[LOADER][ERROR] Stall guest-thread: ... {threads.Length - logged} more");
 						break;

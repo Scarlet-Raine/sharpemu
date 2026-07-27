@@ -288,4 +288,23 @@ public sealed class SaveDataExportsTests : IDisposable
         Assert.NotEqual(0u, resource);
         Assert.Equal(sentinel, rcxValue);
     }
+
+    [Fact]
+    public void CreateTransactionResource_SlotHoldsStalePointer_OverwritesAllEightBytes()
+    {
+        // The out-slot is pointer-sized; a stale heap pointer's high dword must
+        // not survive the handle write (it previously produced a mangled
+        // pointer that the guest allocator rejected as an unrecognized block).
+        const ulong stalePointer = 0x0000_0010_DEAD_BEEF;
+        Assert.True(_ctx.TryWriteUInt64(TransactionOut, stalePointer));
+
+        Assert.Equal(
+            0,
+            SaveDataExports.SaveDataCreateTransactionResource(
+                Reg(rdi: UserId, rdx: 1, rcx: TransactionOut)));
+
+        Assert.True(_ctx.TryReadUInt64(TransactionOut, out var resource8));
+        Assert.NotEqual(0UL, resource8);
+        Assert.Equal(0UL, resource8 & 0xFFFF_FFFF_0000_0000);
+    }
 }

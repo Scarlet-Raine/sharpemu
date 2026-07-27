@@ -6,6 +6,7 @@ using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Text;
 using System.Threading;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 
 namespace SharpEmu.Libs.Kernel;
@@ -39,6 +40,34 @@ public static class KernelPthreadExtendedCompatExports
         string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_STRICT_RWLOCK_WRITER_PREFERENCE"), "1", StringComparison.Ordinal);
 
     private static readonly ConcurrentDictionary<ulong, ConcurrentDictionary<int, ulong>> _threadLocalSpecific = new();
+
+    /// <summary>
+    /// Returns true if <paramref name="address"/> matches any TLS value stored for
+    /// the current thread. HLE exports that write to guest-provided output pointers
+    /// can use this to avoid corrupting per-thread structures (e.g. the allocator
+    /// cache stored under TLS key 8) when the game passes a stale/wrong pointer.
+    /// </summary>
+    internal static bool IsCurrentThreadTlsValue(ulong address)
+    {
+        if (address == 0)
+        {
+            return false;
+        }
+
+        var handle = KernelPthreadState.GetCurrentThreadHandle();
+        if (_threadLocalSpecific.TryGetValue(handle, out var values))
+        {
+            foreach (var kvp in values)
+            {
+                if (kvp.Value == address)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
 
     internal static void GetThreadStartScheduling(
         CpuContext ctx,
@@ -1361,6 +1390,10 @@ public static class KernelPthreadExtendedCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        if (_logTlsKey8 && key == 8)
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] tls.key_create: key=8 destructor=0x{destructor:X16}");
+        }
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1401,6 +1434,25 @@ public static class KernelPthreadExtendedCompatExports
         LibraryName = "libKernel")]
     public static int OrbisPthreadKeyDelete(CpuContext ctx) => PosixPthreadKeyDelete(ctx);
 
+    private static readonly bool _logTlsKey8 =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_TLS_KEY8"), "1", StringComparison.Ordinal);
+
+    private static readonly bool _dumpTls8Struct =
+        string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DUMP_TLS8_STRUCT"), "1", StringComparison.Ordinal);
+
+    private static int _dumpTls8StructCount;
+
+    // Spin-wait breaker: when a thread calls pthread_getspecific at a very high
+    // rate (task-graph drain loop), periodically pump the scheduler and
+    // force-wake blocked cooperative waiters.  This breaks the circular
+    // dependency where the main thread spins waiting for workers to complete
+    // tasks, but workers are blocked on condvars that the main thread never
+    // reaches the code to signal.  Rate-limited to avoid overhead on normal
+    // TLS lookups.
+    private static int _getspecificSpinCount;
+    private static long _lastSpinPumpTimestamp;
+    private static int _spinPumpLogCount;
+
     [SysAbiExport(
         Nid = "WrOLvHU0yQM",
         ExportName = "pthread_setspecific",
@@ -1413,6 +1465,10 @@ public static class KernelPthreadExtendedCompatExports
         var currentThreadHandle = KernelPthreadState.GetCurrentThreadHandle();
         if (!_tlsKeys.ContainsKey(key))
         {
+            if (_logTlsKey8 && key == 8)
+            {
+                Console.Error.WriteLine($"[LOADER][TRACE] tls.setspecific: key=8 MISSING_KEY thread=0x{currentThreadHandle:X16} value=0x{value:X16}");
+            }
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
 
@@ -1420,6 +1476,10 @@ public static class KernelPthreadExtendedCompatExports
             currentThreadHandle,
             static _ => new ConcurrentDictionary<int, ulong>());
         values[key] = value;
+        if (_logTlsKey8 && key == 8)
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] tls.setspecific: key=8 thread=0x{currentThreadHandle:X16} value=0x{value:X16}");
+        }
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1443,6 +1503,10 @@ public static class KernelPthreadExtendedCompatExports
         ulong value = 0;
         if (!_tlsKeys.ContainsKey(key))
         {
+            if (_logTlsKey8 && key == 8)
+            {
+                Console.Error.WriteLine($"[LOADER][TRACE] tls.getspecific: key=8 MISSING_KEY thread=0x{currentThreadHandle:X16} -> 0");
+            }
             ctx[CpuRegister.Rax] = 0;
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
@@ -1453,6 +1517,93 @@ public static class KernelPthreadExtendedCompatExports
             value = storedValue;
         }
 
+        if (_logTlsKey8 && key == 8)
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] tls.getspecific: key=8 thread=0x{currentThreadHandle:X16} -> 0x{value:X16}");
+        }
+        if (_dumpTls8Struct && key == 8 && value != 0)
+        {
+            var seq = Interlocked.Increment(ref _dumpTls8StructCount);
+            // Dump at reads 1-2 (early init), 50000-50001 (during spin), and
+            // every 100000 reads thereafter to track counter over time.
+            if (seq <= 2 || seq == 50000 || seq == 50001 ||
+                (seq >= 100000 && seq % 100000 == 0))
+            {
+                var sb = new System.Text.StringBuilder();
+                sb.Append($"[LOADER][DIAG] tls8_struct@0x{value:X16} (seq={seq}):");
+                for (uint off = 0; off < 320; off += 8)
+                {
+                    if (ctx.TryReadUInt64(value + off, out var qword))
+                        sb.Append($" +0x{off:X3}=0x{qword:X16}");
+                    else
+                        sb.Append($" +0x{off:X3}=<fault>");
+                }
+                Console.Error.WriteLine(sb.ToString());
+                // Dump the allocator bin-index table and pool base for size=32.
+                // Bin table at 0x806886430: byte[(size+15)/16] = bin_index.
+                // Pool base at 0x806886420.
+                if (seq == 50000)
+                {
+                    var binSb = new System.Text.StringBuilder();
+                    binSb.Append("[LOADER][DIAG] allocator_bin_table:");
+                    for (uint sz = 16; sz <= 128; sz += 16)
+                    {
+                        var tableIdx = (sz + 15) / 16;
+                        if (ctx.TryReadByte(0x806886430UL + tableIdx, out var binIdx))
+                            binSb.Append($" size={sz}->bin={binIdx}");
+                    }
+                    if (ctx.TryReadUInt64(0x806886420, out var poolBase))
+                        binSb.Append($" pool_base=0x{poolBase:X16}");
+                    Console.Error.WriteLine(binSb.ToString());
+                    // Dump the specific cache entry for size=32's bin.
+                    if (ctx.TryReadByte(0x806886430UL + ((32 + 15) / 16), out var bin32) &&
+                        ctx.TryReadUInt64(value + (uint)(bin32 * 32), out var flHead) &&
+                        ctx.TryReadUInt64(value + (uint)(bin32 * 32) + 8, out var flCountRaw) &&
+                        ctx.TryReadUInt64(value + (uint)(bin32 * 32) + 0x10, out var poolPtr))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][DIAG] allocator_bin32: bin={bin32} entry_off=0x{bin32 * 32:X3} " +
+                            $"freelist_head=0x{flHead:X16} count={flCountRaw & 0xFFFFFFFF} " +
+                            $"pool_ptr=0x{poolPtr:X16}");
+                    }
+                }
+                // Dump slot 2 task entries (48-byte stride) to see their state.
+                if (ctx.TryReadUInt64(value + 0x40, out var slot2Ptr) && slot2Ptr != 0 &&
+                    ctx.TryReadUInt64(value + 0x48, out var slot2CountRaw))
+                {
+                    var slot2Count = (int)(slot2CountRaw & 0xFFFF);
+                    if (slot2Count > 0 && slot2Count <= 256)
+                    {
+                        // Dump first 3 entries (48 bytes each = 6 qwords per entry)
+                        var dumpEntries = Math.Min(slot2Count, 3);
+                        for (int e = 0; e < dumpEntries; e++)
+                        {
+                            var entryBase = slot2Ptr + (uint)(e * 48);
+                            var sb3 = new System.Text.StringBuilder();
+                            sb3.Append($"[LOADER][DIAG] tls8_slot2_entry[{e}]@0x{entryBase:X16}:");
+                            for (uint off = 0; off < 48; off += 8)
+                            {
+                                if (ctx.TryReadUInt64(entryBase + off, out var qword))
+                                    sb3.Append($" +0x{off:X2}=0x{qword:X16}");
+                                else
+                                    sb3.Append($" +0x{off:X2}=<fault>");
+                            }
+                            Console.Error.WriteLine(sb3.ToString());
+                        }
+                    }
+                }
+            }
+        }
+        // Spin-wait breaker (DISABLED): the force-wake + Thread.Sleep(1) inside
+        // the getspecific hot path disrupted the game's task-graph dispatch cadence.
+        // The main thread's spin loop is timing-sensitive: it must poll the task
+        // queue and dispatch workers at full speed.  Inserting a 1 ms sleep every
+        // 8192 calls prevented the dispatch code from running at the expected rate,
+        // causing workers to never receive tasks and the game to stall at 1 frame.
+        // The original diagnosis (workers never signaled) was incorrect — the working
+        // trace proves the game thread exits the spin loop on its own and dispatches
+        // tasks without external help.
+        // if ((Interlocked.Increment(ref _getspecificSpinCount) & 0x1FFF) == 0) { ... }
         ctx[CpuRegister.Rax] = value;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }

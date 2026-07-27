@@ -38,8 +38,15 @@ SPDX-License-Identifier: GPL-2.0-or-later
   </PropertyGroup>
 
   <UsingTask TaskName="SharpEmu.SourceGenerators.GenerateAerolibBinaryTask"
+             Runtime="NET"
              TaskFactory="TaskHostFactory"
-             AssemblyFile="$(SharpEmuAerolibTaskAssembly)" />
+             AssemblyFile="$(SharpEmuAerolibTaskAssembly)"
+             Condition="'$(MSBuildRuntimeType)' == 'Full'" />
+
+  <UsingTask TaskName="SharpEmu.SourceGenerators.GenerateAerolibBinaryTask"
+             Runtime="NET"
+             AssemblyFile="$(SharpEmuAerolibTaskAssembly)"
+             Condition="'$(MSBuildRuntimeType)' == 'Core'" />
 
   <!-- Runs after ResolveProjectReferences (which builds the task assembly) and before
        resource processing embeds the output. Skipped for design-time builds: the IDE

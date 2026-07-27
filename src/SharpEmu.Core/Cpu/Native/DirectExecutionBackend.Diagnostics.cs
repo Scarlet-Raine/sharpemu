@@ -255,6 +255,72 @@ public sealed partial class DirectExecutionBackend
 				}
 			}
 		}
+		// Forward disassembly from the resume RIP: reconstructs the live code
+		// the guest executes AFTER the import returns.  The on-disk eboot text
+		// can differ from the live guest (runtime-decoded/relocated code), so
+		// decode the real bytes the CPU will run.  This reveals spin-loop bodies
+		// that a static IDA view cannot show.
+		if (string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_PROBE_IMPORT_RET_FORWARD"),
+			"1",
+			StringComparison.Ordinal))
+		{
+			// Allow an explicit start address override so conditional-branch targets
+			// unreachable by sequential fall-through can be disassembled live.
+			var forwardStart = returnRip;
+			var fwdAddrEnv = Environment.GetEnvironmentVariable("SHARPEMU_PROBE_IMPORT_RET_FORWARD_ADDR");
+			if (!string.IsNullOrEmpty(fwdAddrEnv) &&
+				ulong.TryParse(fwdAddrEnv.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? fwdAddrEnv[2..] : fwdAddrEnv,
+					System.Globalization.NumberStyles.HexNumber, null, out var fwdAddrOverride))
+			{
+				forwardStart = fwdAddrOverride;
+			}
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] Import#{dispatchIndex} forward disassembly @0x{forwardStart:X16}:");
+			var forwardCursor = forwardStart;
+			var forwardLimit = forwardStart + 0x400;
+			var forwardVisited = new HashSet<ulong>();
+			for (var forwardIndex = 0; forwardIndex < 96; forwardIndex++)
+			{
+				if (!forwardVisited.Add(forwardCursor))
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][TRACE]   0x{forwardCursor:X16}: <loop revisit>");
+					break;
+				}
+				if (!IcedDecoder.TryReadGuestBytes(cpuContext.Memory, forwardCursor, 15, out var forwardBytes) ||
+					!IcedDecoder.TryDecode(forwardCursor, forwardBytes, out var forwardInstruction) ||
+					forwardInstruction.Length <= 0)
+				{
+					Console.Error.WriteLine(
+						$"[LOADER][TRACE]   0x{forwardCursor:X16}: <undecodable>");
+					break;
+				}
+				Console.Error.WriteLine(
+					$"[LOADER][TRACE]   0x{forwardInstruction.Rip:X16}: {forwardInstruction.Text} " +
+					$"bytes={IcedDecoder.FormatBytes(forwardInstruction.Bytes)}");
+				var forwardMnemonic = forwardInstruction.Mnemonic;
+				var nextCursor = forwardCursor + (ulong)forwardInstruction.Length;
+				// Follow unconditional near/short jumps within the function so the
+				// full spin-loop body is reconstructed.
+				if (forwardInstruction.FlowControl == Iced.Intel.FlowControl.UnconditionalBranch &&
+					forwardInstruction.NearBranchTarget is { } jumpTarget)
+				{
+					if (jumpTarget >= forwardStart && jumpTarget < forwardLimit)
+					{
+						forwardCursor = jumpTarget;
+						continue;
+					}
+					break;
+				}
+				forwardCursor = nextCursor;
+				if (string.Equals(forwardMnemonic, "Ret", StringComparison.OrdinalIgnoreCase) ||
+					string.Equals(forwardMnemonic, "Int3", StringComparison.OrdinalIgnoreCase))
+				{
+					break;
+				}
+			}
+		}
 		Span<byte> destination = stackalloc byte[128];
 		if (!cpuContext.Memory.TryRead(returnRip, destination))
 		{
@@ -390,6 +456,98 @@ public sealed partial class DirectExecutionBackend
 				$"[LOADER][TRACE] import-return {phase}: metadata[0x{metadata:X16}]=" +
 				BitConverter.ToString(window.ToArray()).Replace("-", " "));
 		}
+
+		if (phase == "after" &&
+			string.Equals(
+				Environment.GetEnvironmentVariable("SHARPEMU_PROBE_IMPORT_RET_POINTER_GRAPH"),
+				"1",
+				StringComparison.Ordinal))
+		{
+			DumpImportReturnPointerGraph(cpuContext, metadata);
+		}
+	}
+
+	private static void DumpImportReturnPointerGraph(CpuContext cpuContext, ulong root)
+	{
+		const int rootLength = 0x80;
+		const int childLength = 0x40;
+		Span<byte> rootBytes = stackalloc byte[rootLength];
+		if (!cpuContext.Memory.TryRead(root, rootBytes))
+		{
+			return;
+		}
+
+		DumpPointerGraphLines("pointer-root", root, rootBytes);
+
+		var dumped = new HashSet<ulong> { root };
+		var pending = new Queue<(ulong Address, int Depth, string Via)>();
+		EnqueueDataPointers(rootBytes, depth: 1, "root", dumped, pending);
+		Span<byte> childBytes = stackalloc byte[childLength];
+		while (pending.Count != 0 && dumped.Count <= 48)
+		{
+			var node = pending.Dequeue();
+			if (!cpuContext.Memory.TryRead(node.Address, childBytes))
+			{
+				continue;
+			}
+
+			DumpPointerGraphLines(
+				$"pointer depth={node.Depth} via={node.Via}",
+				node.Address,
+				childBytes);
+			if (node.Depth < 3)
+			{
+				EnqueueDataPointers(
+					childBytes,
+					node.Depth + 1,
+					$"0x{node.Address:X}",
+					dumped,
+					pending);
+			}
+		}
+	}
+
+	private static void EnqueueDataPointers(
+		ReadOnlySpan<byte> bytes,
+		int depth,
+		string parent,
+		HashSet<ulong> dumped,
+		Queue<(ulong Address, int Depth, string Via)> pending)
+	{
+		for (var offset = 0; offset < bytes.Length; offset += sizeof(ulong))
+		{
+			var value = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(
+				bytes.Slice(offset, sizeof(ulong)));
+			var isGuestCode = value is > 0x8_0000_0000 and < 0x9_0000_0000;
+			var isGuestData = value is >= 0x10_0000_0000 and < 0x100_0000_0000;
+			if ((isGuestData || (isGuestCode && depth >= 3)) && dumped.Add(value))
+			{
+				pending.Enqueue((value, depth, $"{parent}+0x{offset:X}"));
+			}
+		}
+	}
+
+	private static void DumpPointerGraphLines(
+		string label,
+		ulong address,
+		ReadOnlySpan<byte> bytes)
+	{
+		const int bytesPerLine = 4 * sizeof(ulong);
+		for (var offset = 0; offset < bytes.Length; offset += bytesPerLine)
+		{
+			var line = bytes.Slice(offset, Math.Min(bytesPerLine, bytes.Length - offset));
+			var values = new string[line.Length / sizeof(ulong)];
+			for (var valueOffset = 0; valueOffset < line.Length; valueOffset += sizeof(ulong))
+			{
+				var value = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(
+					line.Slice(valueOffset, sizeof(ulong)));
+				values[valueOffset / sizeof(ulong)] = $"0x{value:X16}";
+			}
+
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] import-return {label}=0x{address:X16}+0x{offset:X2} " +
+				string.Join(' ', values));
+		}
 	}
 
 	private void ConfigureGuestRipSampler()
@@ -426,10 +584,21 @@ public sealed partial class DirectExecutionBackend
 			Environment.GetEnvironmentVariable("SHARPEMU_SAMPLE_GUEST_MAX_SNAPSHOTS"),
 			64,
 			512);
-		_guestRipSampler = new GuestRipSampler(this, armReturnRip, minimumRip, maximumRip, maximumSamples);
+		var mediaPumpOnly = string.Equals(
+			Environment.GetEnvironmentVariable("SHARPEMU_SAMPLE_MEDIA_PUMP_ONLY"),
+			"1",
+			StringComparison.Ordinal);
+		_guestRipSampler = new GuestRipSampler(
+			this,
+			armReturnRip,
+			minimumRip,
+			maximumRip,
+			maximumSamples,
+			mediaPumpOnly);
 		Console.Error.WriteLine(
 			$"[LOADER][TRACE] guest-rip-sampler configured: after_ret=0x{armReturnRip:X16} " +
-			$"range=0x{minimumRip:X16}-0x{maximumRip:X16} max={maximumSamples}");
+			$"range=0x{minimumRip:X16}-0x{maximumRip:X16} max={maximumSamples} " +
+			$"media_pump_only={mediaPumpOnly}");
 	}
 
 	private void ArmGuestRipSampler(ulong returnRip)
@@ -450,6 +619,9 @@ public sealed partial class DirectExecutionBackend
 			: fallback;
 	}
 
+	internal static bool ShouldArmGuestRipSampler(bool mediaPumpOnly, ulong currentThreadHandle) =>
+		!mediaPumpOnly || GuestThreadExecution.IsMediaPumpThread(currentThreadHandle);
+
 	/// <summary>
 	/// Captures a bounded series of worker-thread contexts after a selected HLE
 	/// return. The sampler only reads contexts; it never changes debug registers,
@@ -462,6 +634,7 @@ public sealed partial class DirectExecutionBackend
 		private readonly ulong _minimumRip;
 		private readonly ulong _maximumRip;
 		private readonly int _maximumSamples;
+		private readonly bool _mediaPumpOnly;
 		private readonly AutoResetEvent _armed = new(false);
 		private readonly Thread _thread;
 		private int _hostThreadId;
@@ -473,13 +646,15 @@ public sealed partial class DirectExecutionBackend
 			ulong armReturnRip,
 			ulong minimumRip,
 			ulong maximumRip,
-			int maximumSamples)
+			int maximumSamples,
+			bool mediaPumpOnly)
 		{
 			_backend = backend;
 			_armReturnRip = armReturnRip;
 			_minimumRip = minimumRip;
 			_maximumRip = maximumRip;
 			_maximumSamples = maximumSamples;
+			_mediaPumpOnly = mediaPumpOnly;
 			_thread = new Thread(ThreadMain)
 			{
 				IsBackground = true,
@@ -491,6 +666,9 @@ public sealed partial class DirectExecutionBackend
 		public void Arm(ulong returnRip, uint hostThreadId)
 		{
 			if (returnRip != _armReturnRip ||
+				!ShouldArmGuestRipSampler(
+					_mediaPumpOnly,
+					GuestThreadExecution.CurrentGuestThreadHandle) ||
 				Interlocked.CompareExchange(ref _armedOnce, 1, 0) != 0)
 			{
 				return;
@@ -524,7 +702,12 @@ public sealed partial class DirectExecutionBackend
 						$"[LOADER][TRACE] guest-rip-sample #{captured}: rip=0x{snapshot.Rip:X16} " +
 						$"rsp=0x{snapshot.Rsp:X16} rbp=0x{snapshot.Rbp:X16} " +
 						$"rax=0x{snapshot.Rax:X16} rdi=0x{snapshot.Rdi:X16} " +
-						$"r12=0x{snapshot.R12:X16} r14=0x{snapshot.R14:X16}");
+						$"rcx=0x{snapshot.Rcx:X16}('{DescribeGuestText(snapshot.Rcx)}') " +
+						$"rdx=0x{snapshot.Rdx:X16}('{DescribeGuestText(snapshot.Rdx)}') " +
+						$"r12=0x{snapshot.R12:X16} r14=0x{snapshot.R14:X16} " +
+						$"[r14]={DescribeGuestQwords(snapshot.R14, 12)} " +
+						$"{DescribeWorkSource(snapshot.R14)} " +
+						$"code=[{DescribeGuestCode(snapshot.Rip, 5)}]");
 				}
 
 				Thread.SpinWait(128);
@@ -644,6 +827,166 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
+	}
+
+	// Diagnostic: dump up to 8 qwords at a guest address (guest VA == host VA) so
+	// the sampler can reveal the polled object's fields. Returns "" when
+	// unreadable. Only used by the guest-RIP sampler log.
+	private static string DescribeGuestQwords(ulong address, int count)
+	{
+		if (count <= 0 || count > 12)
+		{
+			count = 12;
+		}
+
+		var builder = new System.Text.StringBuilder();
+		for (var i = 0; i < count; i++)
+		{
+			if (i != 0)
+			{
+				builder.Append(' ');
+			}
+
+			if (TryReadStackU64(address + (ulong)(i * 8), out var value))
+			{
+				builder.Append("0x").Append(value.ToString("X16"));
+			}
+			else
+			{
+				builder.Append("--");
+			}
+		}
+
+		return builder.ToString();
+	}
+
+	// Diagnostic: follow the media-ticker work-source pointer at [mediaObj+0x50],
+	// read its vtable and the first 6 method pointers (relocated runtime VAs), so
+	// method[4] (the dequeue/wait) can be mapped to IDA and decompiled.
+	private static string DescribeWorkSource(ulong mediaObj)
+	{
+		if (!TryReadStackU64(mediaObj + 0x50, out var ws) || ws == 0)
+		{
+			return "ws=null";
+		}
+
+		var builder = new System.Text.StringBuilder();
+		builder.Append("ws=0x").Append(ws.ToString("X16"));
+		if (TryReadStackU64(ws, out var vt) && vt != 0)
+		{
+			builder.Append(" vt=0x").Append(vt.ToString("X16"));
+			for (var i = 0; i < 6; i++)
+			{
+				builder.Append(" m").Append(i).Append("=0x");
+				builder.Append(TryReadStackU64(vt + (ulong)(i * 8), out var m) ? m.ToString("X16") : "--");
+			}
+		}
+
+		return builder.ToString();
+	}
+
+	// Diagnostic: disassemble a few instructions at a guest RIP (guest VA == host
+	// VA) so the sampler shows the exact compare/branch and the object field
+	// offset the media-tick loop tests. Returns "" when unreadable.
+	private static string DescribeGuestCode(ulong rip, int instructionCount)
+	{
+		Span<byte> code = stackalloc byte[32];
+		for (var i = 0; i < 4; i++)
+		{
+			if (!TryReadStackU64(rip + (ulong)(i * 8), out var value))
+			{
+				return string.Empty;
+			}
+
+			System.Buffers.Binary.BinaryPrimitives.WriteUInt64LittleEndian(code[(i * 8)..], value);
+		}
+
+		var builder = new System.Text.StringBuilder();
+		var cursor = rip;
+		var consumed = 0;
+		for (var n = 0; n < instructionCount && consumed < 32; n++)
+		{
+			if (!SharpEmu.Core.Cpu.Disasm.IcedDecoder.TryDecode(cursor, code[consumed..], out var inst) ||
+				inst.Length <= 0)
+			{
+				break;
+			}
+
+			if (n != 0)
+			{
+				builder.Append(" ; ");
+			}
+
+			builder.Append(inst.Text);
+			consumed += inst.Length;
+			cursor += (ulong)inst.Length;
+		}
+
+		return builder.ToString();
+	}
+
+	// Diagnostic: safely read a short string at a guest address (guest VA == host
+	// VA). Tries UTF-16 (RAGE/Scaleform FName keys are wide) then ASCII; returns
+	// "" when unreadable/non-textual. Only used by the guest-RIP sampler log.
+	private unsafe static string DescribeGuestText(ulong address)
+	{
+		if (address <= 65536 || address >= 140737488355328L)
+		{
+			return string.Empty;
+		}
+
+		if (VirtualQuery((void*)address, out var info, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+			info.State != 4096 || !IsReadableProtection(info.Protect))
+		{
+			return string.Empty;
+		}
+
+		var regionEnd = info.BaseAddress + info.RegionSize;
+		if (regionEnd <= address)
+		{
+			return string.Empty;
+		}
+
+		var max = (int)Math.Min(96uL, regionEnd - address);
+		Span<byte> bytes = stackalloc byte[96];
+		bytes = bytes[..max];
+		try
+		{
+			fixed (byte* destination = bytes)
+			{
+				Buffer.MemoryCopy((void*)address, destination, max, max);
+			}
+		}
+		catch
+		{
+			return string.Empty;
+		}
+
+		// UTF-16: printable low byte with a zero high byte at even offsets.
+		var wide = new System.Text.StringBuilder();
+		for (var i = 0; i + 1 < max; i += 2)
+		{
+			var lo = bytes[i];
+			var hi = bytes[i + 1];
+			if (lo == 0 && hi == 0) break;
+			if (hi != 0 || lo < 0x20 || lo > 0x7E) { wide.Clear(); break; }
+			wide.Append((char)lo);
+		}
+
+		if (wide.Length >= 3)
+		{
+			return wide.ToString();
+		}
+
+		var ascii = new System.Text.StringBuilder();
+		foreach (var b in bytes)
+		{
+			if (b == 0) break;
+			if (b < 0x20 || b > 0x7E) { ascii.Clear(); break; }
+			ascii.Append((char)b);
+		}
+
+		return ascii.Length >= 3 ? ascii.ToString() : string.Empty;
 	}
 
 	private static bool IsLikelyReturnAddress(ulong address)

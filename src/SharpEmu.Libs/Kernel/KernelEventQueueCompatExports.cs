@@ -500,10 +500,24 @@ public static class KernelEventQueueCompatExports
 
         if (queued)
         {
+            if (_logEqueue)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] equeue.enqueue: handle=0x{handle:X16} ident=0x{queuedEvent.Ident:X16} " +
+                    $"filter={queuedEvent.Filter} pending={PendingCount(handle)}");
+            }
             WakeEventQueue(handle);
         }
 
         return queued;
+    }
+
+    private static int PendingCount(ulong handle)
+    {
+        lock (_eventQueueGate)
+        {
+            return _pendingEvents.TryGetValue(handle, out var q) ? q.Count : 0;
+        }
     }
 
     public static bool RegisterEvent(
@@ -650,13 +664,149 @@ public static class KernelEventQueueCompatExports
     }
 
     /// <summary>
+    /// Triggers vblank events on every equeue that has an ident-0
+    /// graphics-filter registration. PS5 titles that use the AGC driver
+    /// rely on it to signal vblank internally; the guest never calls
+    /// <c>sceVideoOutAddVblankEvent</c>, so the standard vblank path does
+    /// not reach their event queue. Delivering a graphics-filter event at
+    /// the display cadence unblocks the game's interrupt thread so it can
+    /// pace the next frame.
+    /// Only the ident-0 registration may carry this synthetic event: the
+    /// AGC driver registers separate eventIds per interrupt source, and
+    /// pending events coalesce per (ident, filter) with counting fflags
+    /// (see <see cref="QueueOrUpdateEvent"/>). Landing fabricated events
+    /// on a nonzero ident inflates the guest's submission-completion count
+    /// and overwrites the pending completion payload, which makes the
+    /// driver retire command/label memory before the ordered GPU-side
+    /// writes have landed (observed as an FMallocBinned3 "unrecognized
+    /// block" heap fault in GTA SA DE). Queues without an ident-0
+    /// registration receive nothing rather than a forged completion.
+    /// </summary>
+    public static int TriggerAgcVblankEvents(ulong data)
+    {
+        List<ulong>? wakeHandles = null;
+        var triggeredCount = 0;
+        lock (_eventQueueGate)
+        {
+            foreach (var (handle, registrations) in _registeredEvents)
+            {
+                if (!registrations.TryGetValue(
+                        (0UL, KernelEventFilterGraphics),
+                        out var registration))
+                {
+                    continue;
+                }
+
+                if (!_pendingEvents.TryGetValue(handle, out var queue))
+                {
+                    queue = new KernelEventDeque();
+                    _pendingEvents[handle] = queue;
+                }
+
+                QueueOrUpdateEvent(
+                    queue,
+                    new KernelQueuedEvent(
+                        registration.Ident,
+                        registration.Filter,
+                        0,
+                        1,
+                        data,
+                        registration.UserData));
+                (wakeHandles ??= new List<ulong>()).Add(handle);
+                triggeredCount++;
+            }
+        }
+
+        if (wakeHandles is not null)
+        {
+            foreach (var handle in wakeHandles)
+            {
+                WakeEventQueue(handle);
+            }
+        }
+
+        return triggeredCount;
+    }
+
+    /// <summary>
+    /// Delivers a RELEASE_MEM end-of-pipe interrupt to every equeue with a
+    /// graphics-filter registration whose eventId equals the packet's
+    /// interrupt context id. On hardware the AGC driver routes the EOP
+    /// interrupt to the eq event registered under that id; titles gate their
+    /// frame loop on this event (GTA SA DE requests interrupt=2 with context
+    /// id 0 on its per-frame fence and registers eventId 0 for it), so
+    /// dropping the interrupt freezes the game after the first frame even
+    /// though the fence memory write itself landed. Exact-ident routing keeps
+    /// this distinct from whole-submission completions
+    /// (<see cref="TriggerRegisteredEventsDistinct"/>), which prefer nonzero
+    /// idents precisely so the pacing ident is left to interrupt sources.
+    /// </summary>
+    public static int TriggerAgcEopInterruptEvents(ulong ident, ulong data)
+    {
+        List<ulong>? wakeHandles = null;
+        var triggeredCount = 0;
+        lock (_eventQueueGate)
+        {
+            foreach (var (handle, registrations) in _registeredEvents)
+            {
+                if (!registrations.TryGetValue(
+                        (ident, KernelEventFilterGraphics),
+                        out var registration))
+                {
+                    continue;
+                }
+
+                if (!_pendingEvents.TryGetValue(handle, out var queue))
+                {
+                    queue = new KernelEventDeque();
+                    _pendingEvents[handle] = queue;
+                }
+
+                QueueOrUpdateEvent(
+                    queue,
+                    new KernelQueuedEvent(
+                        registration.Ident,
+                        registration.Filter,
+                        0,
+                        1,
+                        data,
+                        registration.UserData));
+                (wakeHandles ??= new List<ulong>()).Add(handle);
+                triggeredCount++;
+            }
+        }
+
+        if (wakeHandles is not null)
+        {
+            foreach (var handle in wakeHandles)
+            {
+                WakeEventQueue(handle);
+            }
+        }
+
+        return triggeredCount;
+    }
+
+    /// <summary>
     /// Queues one event for every registration using <paramref name="filter"/>.
     /// Unlike <see cref="TriggerRegisteredEvents"/>, this preserves distinct
     /// event identifiers registered on the same queue. AGC driver completion
     /// queues use this form because the driver, rather than a packet-provided
     /// identifier, announces that the whole submission reached end-of-pipe.
+    /// The <paramref name="data"/> parameter carries the submission-specific
+    /// payload (e.g. the DCB command buffer address) so the guest can identify
+    /// which submission completed.
+    /// A completion is one hardware interrupt, so it must land on exactly one
+    /// registration per queue. Titles that register several eventIds on one
+    /// queue (GTA SA DE: 0x20 and 0x00) reserve ident 0 for the vblank-style
+    /// pacing source, and delivering the completion there too doubles the
+    /// guest's retire count: it frees the next submission's command and label
+    /// memory while the ordered release_mem write is still queued, and that
+    /// stale write lands in recycled heap (FMallocBinned3 "unrecognized
+    /// block"). Prefer a nonzero-ident registration; fall back to ident 0
+    /// only when it is the queue's sole graphics registration.
     /// </summary>
-    public static int TriggerRegisteredEventsDistinct(short filter)
+    public static int TriggerRegisteredEventsDistinct(short filter, ulong data = 0)
     {
         HashSet<ulong>? wakeHandles = null;
         var triggeredCount = 0;
@@ -664,6 +814,8 @@ public static class KernelEventQueueCompatExports
         {
             foreach (var (handle, registrations) in _registeredEvents)
             {
+                var deliveredCompletion = false;
+                var hasIdentZero = false;
                 foreach (var registration in registrations.Values)
                 {
                     if (registration.Filter != filter)
@@ -671,22 +823,22 @@ public static class KernelEventQueueCompatExports
                         continue;
                     }
 
-                    if (!_pendingEvents.TryGetValue(handle, out var queue))
+                    if (registration.Ident == 0)
                     {
-                        queue = new KernelEventDeque();
-                        _pendingEvents[handle] = queue;
+                        hasIdentZero = true;
+                        continue;
                     }
 
-                    QueueOrUpdateEvent(
-                        queue,
-                        new KernelQueuedEvent(
-                            registration.Ident,
-                            registration.Filter,
-                            0,
-                            1,
-                            registration.Ident,
-                            registration.UserData));
-                    (wakeHandles ??= []).Add(handle);
+                    QueueCompletionEventLocked(handle, registration, data, ref wakeHandles);
+                    deliveredCompletion = true;
+                    triggeredCount++;
+                }
+
+                if (!deliveredCompletion &&
+                    hasIdentZero &&
+                    registrations.TryGetValue((0UL, filter), out var identZero))
+                {
+                    QueueCompletionEventLocked(handle, identZero, data, ref wakeHandles);
                     triggeredCount++;
                 }
             }
@@ -701,6 +853,30 @@ public static class KernelEventQueueCompatExports
         }
 
         return triggeredCount;
+    }
+
+    private static void QueueCompletionEventLocked(
+        ulong handle,
+        KernelEventRegistration registration,
+        ulong data,
+        ref HashSet<ulong>? wakeHandles)
+    {
+        if (!_pendingEvents.TryGetValue(handle, out var queue))
+        {
+            queue = new KernelEventDeque();
+            _pendingEvents[handle] = queue;
+        }
+
+        QueueOrUpdateEvent(
+            queue,
+            new KernelQueuedEvent(
+                registration.Ident,
+                registration.Filter,
+                0,
+                1,
+                data,
+                registration.UserData));
+        (wakeHandles ??= []).Add(handle);
     }
 
     private static bool TriggerRegisteredEvent(
@@ -806,6 +982,11 @@ public static class KernelEventQueueCompatExports
         ulong outCountAddress)
     {
         var deliveredCount = DequeueEvents(ctx, handle, eventsAddress, eventCapacity);
+        if (_logEqueue)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] equeue.resume: handle=0x{handle:X16} delivered={deliveredCount} capacity={eventCapacity}");
+        }
         if (outCountAddress != 0 && !TryWriteUInt32(ctx, outCountAddress, (uint)deliveredCount))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
@@ -850,7 +1031,12 @@ public static class KernelEventQueueCompatExports
 
     private static void WakeEventQueue(ulong handle)
     {
-        _ = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetEventQueueWakeKey(handle));
+        var wakeCount = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetEventQueueWakeKey(handle)) ?? 0;
+        if (_logEqueue)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] equeue.wake: handle=0x{handle:X16} woke={wakeCount}");
+        }
     }
 
     private static int DequeueEvents(CpuContext ctx, ulong handle, ulong eventsAddress, int eventCapacity)

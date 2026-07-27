@@ -198,6 +198,10 @@ public static class VideoOutExports
         public ulong VblankCount { get; set; }
         public ulong FlipCount { get; set; }
         public int CurrentBuffer { get; set; } = -1;
+
+        // Last flipArg the guest submitted; reported at SceVideoOutFlipStatus
+        // +0x18 so titles gating on their own flip token see it advance.
+        public long LastFlipArg { get; set; } = -1;
         public uint OutputWidth { get; set; } = 1920;
         public uint OutputHeight { get; set; } = 1080;
         public uint RefreshRate { get; set; } = 60;
@@ -501,6 +505,12 @@ public static class VideoOutExports
             return OrbisVideoOutErrorInvalidHandle;
         }
 
+        var waitNum = Interlocked.Increment(ref _vblankWaitCount);
+        if (waitNum <= 16 || (waitNum & (waitNum - 1)) == 0)
+        {
+            TraceVideoOut($"videoout.wait_vblank #{waitNum} handle={handle}");
+        }
+
         // Wait to the next boundary of the emulated display refresh rather
         // than a raw Thread.Sleep(1): coarse sleeps overshoot to the
         // scheduler quantum, which mis-paces games that spin on vblank. A
@@ -710,17 +720,35 @@ public static class VideoOutExports
 
         ulong count;
         uint currentBuffer;
+        long flipArg;
         lock (_stateGate)
         {
             count = port.FlipCount;
             currentBuffer = unchecked((uint)port.CurrentBuffer);
+            flipArg = port.LastFlipArg;
         }
 
+        var pollNum = Interlocked.Increment(ref _flipStatusPollCount);
+        if (pollNum <= 32 || (pollNum & (pollNum - 1)) == 0)
+        {
+            TraceVideoOut(
+                $"videoout.get_flip_status poll#{pollNum} handle={handle} " +
+                $"flipCount={count} currentBuf={currentBuffer} flipArg={flipArg}");
+        }
+
+        // Full 0x40-byte SceVideoOutFlipStatus. Flips complete synchronously in
+        // this host, so gcQueueNum/flipPendingNum are truthfully zero; leaving
+        // any tail field unwritten hands the guest stack garbage — Ghost of
+        // Yōtei polls flipPendingNum (+0x34) until it reads zero.
+        var timestamp = unchecked((ulong)Stopwatch.GetTimestamp());
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x00, count);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x08, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x10, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x20, currentBuffer);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x08, timestamp);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x10, timestamp);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, unchecked((ulong)flipArg));
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x20, 0);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x28, 0);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x30, 0);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x38, currentBuffer);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -737,6 +765,11 @@ public static class VideoOutExports
             return OrbisVideoOutErrorInvalidHandle;
         }
 
+        var checkNum = Interlocked.Increment(ref _flipPendingCheckCount);
+        if (checkNum <= 16 || (checkNum & (checkNum - 1)) == 0)
+        {
+            TraceVideoOut($"videoout.is_flip_pending check#{checkNum} handle={handle} pending=0");
+        }
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1159,6 +1192,7 @@ public static class VideoOutExports
 
             port.CurrentBuffer = bufferIndex;
             port.FlipCount++;
+            port.LastFlipArg = flipArg;
             eventHint = SceVideoOutInternalEventFlip |
                 ((unchecked((ulong)flipArg) & 0x0000_FFFF_FFFF_FFFFUL) << 16);
             flipEventCount = port.FlipEvents.Count;
@@ -1229,6 +1263,13 @@ public static class VideoOutExports
             TriggerFlipEvents();
         }
 
+        // A flip means the game is presenting frames and needs vblank pacing.
+        // AGC-driver titles never call sceVideoOutAddVblankEvent; they rely on
+        // the driver to signal vblank on their AGC equeue.  Starting the tick
+        // here ensures the vblank cadence advances even without an explicit
+        // vblank registration.
+        StartVblankThreadOnce();
+
         TraceVideoOut(
             $"videoout.submit_flip handle={handle} index={bufferIndex} mode={flipMode} " +
             $"arg={flipArg} addr=0x{guestImageAddress:X16} submitted={guestImageSubmitted} " +
@@ -1286,6 +1327,14 @@ public static class VideoOutExports
         Environment.GetEnvironmentVariable("SHARPEMU_NO_FLIP_PACING"),
         "1",
         StringComparison.Ordinal);
+
+    // Diagnostic kill-switch to isolate the AGC vblank broadcast when
+    // investigating guest-visible side effects of the synthetic events.
+    private static readonly bool _agcVblankDisabled = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_NO_AGC_VBLANK"),
+        "1",
+        StringComparison.Ordinal);
+
     private static long _lastFlipPacingTimestamp;
 
     private static Thread? _vblankThread;
@@ -1356,6 +1405,16 @@ public static class VideoOutExports
                     OrbisKernelEventFilterVideoOut,
                     dataHint,
                     userData);
+            }
+
+            // AGC-driver titles register graphics-filter events on their equeue
+            // but never call sceVideoOutAddVblankEvent.  The real AGC driver
+            // signals vblank internally; emulate that by broadcasting a
+            // graphics-filter event at the display cadence.
+            if (!_agcVblankDisabled)
+            {
+                _ = KernelEventQueueCompatExports.TriggerAgcVblankEvents(
+                    (ulong)Environment.TickCount64);
             }
 
             var interval = Stopwatch.Frequency / Math.Max(1, (long)refresh);
@@ -2060,6 +2119,10 @@ public static class VideoOutExports
         value = BinaryPrimitives.ReadInt16LittleEndian(buffer);
         return true;
     }
+
+    private static long _vblankWaitCount;
+    private static long _flipStatusPollCount;
+    private static long _flipPendingCheckCount;
 
     private static readonly bool _traceVideoOut = string.Equals(
         Environment.GetEnvironmentVariable("SHARPEMU_LOG_VIDEOOUT"),

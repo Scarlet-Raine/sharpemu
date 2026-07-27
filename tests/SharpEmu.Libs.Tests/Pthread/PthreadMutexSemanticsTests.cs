@@ -26,7 +26,7 @@ public sealed class PthreadMutexSemanticsTests
     }
 
     [Fact]
-    public void AdaptiveMutex_GuestTrackedSelfLockReturnsDeadlockAndSingleUnlockReleases()
+    public void AdaptiveMutex_GuestTrackedSelfLockIsIdempotentAndSingleUnlockReleases()
     {
         const ulong memoryBase = 0x1_0001_0000;
         const ulong mutexAddress = memoryBase + 0x100;
@@ -37,11 +37,12 @@ public sealed class PthreadMutexSemanticsTests
 
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
 
+        // Guest fast-path locking updates guest mutex memory before the HLE call,
+        // so a guest-tracked self-lock is a false deadlock positive. It must be
+        // treated as an idempotent re-lock (games call abort() on EDEADLK).
         var currentThreadHandle = KernelPthreadState.GetCurrentThreadHandle();
         Assert.True(context.TryWriteUInt64(mutexAddress + 8, currentThreadHandle));
-        Assert.Equal(
-            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK,
-            KernelPthreadCompatExports.PthreadMutexLock(context));
+        Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexLock(context));
 
         Assert.True(context.TryWriteUInt64(mutexAddress + 8, 0));
         Assert.Equal(0, KernelPthreadCompatExports.PthreadMutexUnlock(context));

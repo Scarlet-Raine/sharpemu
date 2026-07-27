@@ -93,7 +93,8 @@ internal sealed record VulkanOrderedGuestFlip(
     ulong Address,
     uint Width,
     uint Height,
-    uint PitchInPixel);
+    uint PitchInPixel,
+    uint GuestFormat);
 
 internal sealed record VulkanOrderedGuestFlipWait(
     long Version,
@@ -1666,6 +1667,10 @@ internal static unsafe class VulkanVideoPresenter
 
             var version = ++_orderedGuestFlipVersionSequence;
             _lastOrderedGuestFlipVersions[(videoOutHandle, displayBufferIndex)] = version;
+            _availableGuestImages.TryGetValue(address, out var guestFormat);
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] vk.flip_enqueue version={version} " +
+                $"addr=0x{address:X16} guestFormat=0x{guestFormat:X8}");
             return EnqueueGuestWorkLocked(
                 new VulkanOrderedGuestFlip(
                     version,
@@ -1674,7 +1679,8 @@ internal static unsafe class VulkanVideoPresenter
                     address,
                     width,
                     height,
-                    pitchInPixel)) > 0;
+                    pitchInPixel,
+                    guestFormat)) > 0;
         }
     }
 
@@ -1841,16 +1847,24 @@ internal static unsafe class VulkanVideoPresenter
 
     // Display buffers registered through sceVideoOutRegisterBuffers remain
     // valid flip targets even before AGC has rendered into them.
-    internal static void RegisterKnownDisplayBuffer(ulong address, uint guestFormat)
+    internal static void RegisterKnownDisplayBuffer(ulong address, uint dataFormat)
     {
-        if (address == 0 || guestFormat == 0)
+        if (address == 0 || dataFormat == 0)
         {
             return;
         }
 
+        // Encode the raw data format code into the guest texture format used by
+        // _availableGuestImages: bits [15:8] = dataFormat, bits [7:0] = numberType.
+        // CreateDisplayBufferPlaceholder decodes this to reconstruct the Vulkan format.
+        var guestFormat = (dataFormat & 0x1FFu) << 8;
+
         lock (_gate)
         {
             _availableGuestImages[address] = guestFormat;
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] vk.register_display_buffer " +
+                $"addr=0x{address:X16} guestFormat=0x{guestFormat:X8}");
         }
     }
 
@@ -5057,6 +5071,122 @@ internal static unsafe class VulkanVideoPresenter
             SubmitGuestCommandBuffer(commandBuffer, [], []);
         }
 
+        /// <summary>
+        /// Creates a minimal Vulkan image for a display buffer that was registered
+        /// through sceVideoOutRegisterBuffers but never used as a render target.
+        /// This allows the first flip capture to succeed with a blank frame rather
+        /// than silently dropping every frame until the game renders into the
+        /// buffer.
+        /// </summary>
+        private GuestImageResource? CreateDisplayBufferPlaceholder(
+            ulong address, uint width, uint height, uint guestFormat)
+        {
+            var dataFormat = (guestFormat >> 8) & 0x1FFu;
+            var numberType = guestFormat & 0xFFu;
+            if (!TryDecodeRenderTargetFormat(dataFormat, numberType, out var rtFormat))
+            {
+                return null;
+            }
+
+            var format = rtFormat.Format;
+            var physicalWidth = ScaleGuestDimension(width);
+            var physicalHeight = ScaleGuestDimension(height);
+
+            var imageInfo = new ImageCreateInfo
+            {
+                SType = StructureType.ImageCreateInfo,
+                ImageType = ImageType.Type2D,
+                Format = format,
+                Extent = new Extent3D(physicalWidth, physicalHeight, 1),
+                MipLevels = 1,
+                ArrayLayers = 1,
+                Samples = SampleCountFlags.Count1Bit,
+                Tiling = ImageTiling.Optimal,
+                Usage =
+                    ImageUsageFlags.TransferSrcBit |
+                    ImageUsageFlags.TransferDstBit |
+                    ImageUsageFlags.SampledBit |
+                    ImageUsageFlags.ColorAttachmentBit,
+                SharingMode = SharingMode.Exclusive,
+                InitialLayout = ImageLayout.Undefined,
+            };
+            if (_vk.CreateImage(_device, &imageInfo, null, out var image) != Result.Success)
+            {
+                return null;
+            }
+
+            _vk.GetImageMemoryRequirements(_device, image, out var requirements);
+            var allocationInfo = new MemoryAllocateInfo
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = requirements.Size,
+                MemoryTypeIndex = FindMemoryType(
+                    requirements.MemoryTypeBits,
+                    MemoryPropertyFlags.DeviceLocalBit),
+            };
+            if (_vk.AllocateMemory(_device, &allocationInfo, null, out var memory) != Result.Success ||
+                _vk.BindImageMemory(_device, image, memory, 0) != Result.Success)
+            {
+                _vk.DestroyImage(_device, image, null);
+                if (memory.Handle != 0)
+                {
+                    _vk.FreeMemory(_device, memory, null);
+                }
+                return null;
+            }
+
+            TransitionNewGuestImageToSampled(image, 1);
+
+            var viewInfo = new ImageViewCreateInfo
+            {
+                SType = StructureType.ImageViewCreateInfo,
+                Image = image,
+                ViewType = ImageViewType.Type2D,
+                Format = format,
+                Components = new ComponentMapping(
+                    ComponentSwizzle.Identity,
+                    ComponentSwizzle.Identity,
+                    ComponentSwizzle.Identity,
+                    ComponentSwizzle.Identity),
+                SubresourceRange = ColorSubresourceRange(0, 1),
+            };
+            if (_vk.CreateImageView(_device, &viewInfo, null, out var view) != Result.Success)
+            {
+                _vk.DestroyImage(_device, image, null);
+                _vk.FreeMemory(_device, memory, null);
+                return null;
+            }
+
+            SetDebugName(ObjectType.Image, image.Handle, $"display-buffer-placeholder 0x{address:X}");
+
+            var resource = new GuestImageResource
+            {
+                Address = address,
+                Width = physicalWidth,
+                Height = physicalHeight,
+                LogicalWidth = width,
+                LogicalHeight = height,
+                MipLevels = 1,
+                GuestFormat = guestFormat,
+                Format = format,
+                Image = image,
+                Memory = memory,
+                View = view,
+                Initialized = true,
+            };
+            _guestImages[address] = resource;
+            lock (_gate)
+            {
+                _guestImageExtents[address] = (width, height,
+                    GetTextureByteCount(dataFormat, width, height));
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][INFO] vk.display_buffer_placeholder " +
+                $"addr=0x{address:X16} {width}x{height} fmt={format}");
+            return resource;
+        }
+
         private void EnsureGuestSubmissionCapacity()
         {
             CollectCompletedGuestSubmissions(waitForOldest: false);
@@ -5318,6 +5448,17 @@ internal static unsafe class VulkanVideoPresenter
         {
             FlushBatchedGuestCommands();
             _guestImages.TryGetValue(work.Address, out var source);
+
+            // A display buffer registered via sceVideoOutRegisterBuffers may not
+            // yet have a Vulkan image if the game has not rendered into it.  Create
+            // a placeholder so the first flip captures something (even a blank
+            // frame) rather than silently dropping the frame.
+            if (source is null && work.GuestFormat != 0)
+            {
+                source = CreateDisplayBufferPlaceholder(
+                    work.Address, work.Width, work.Height, work.GuestFormat);
+            }
+
             if (_deviceLost ||
                 source is null ||
                 !source.Initialized)
@@ -5325,7 +5466,8 @@ internal static unsafe class VulkanVideoPresenter
                 Console.Error.WriteLine(
                     $"[LOADER][WARN] vk.flip_capture_failed version={work.Version} " +
                     $"queue={_activeGuestQueue.Name} addr=0x{work.Address:X16} " +
-                    $"found={(source is not null)} initialized={(source?.Initialized ?? false)}");
+                    $"found={(source is not null)} initialized={(source?.Initialized ?? false)} " +
+                    $"guestFormat=0x{work.GuestFormat:X8} w={work.Width} h={work.Height}");
                 return;
             }
 

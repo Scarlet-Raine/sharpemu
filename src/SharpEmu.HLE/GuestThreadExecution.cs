@@ -152,6 +152,8 @@ public readonly record struct GuestCpuContinuation(
 
 public static class GuestThreadExecution
 {
+    private static long _mediaPumpThreadHandle;
+
     private sealed class DelegateGuestThreadBlockWaiter : IGuestThreadBlockWaiter
     {
         private readonly Func<int> _resume;
@@ -222,6 +224,13 @@ public static class GuestThreadExecution
     public static IGuestThreadScheduler? Scheduler { get; set; }
 
     /// <summary>
+    /// Registered by the pthread condvar implementation to force-wake
+    /// cooperative waiters when the main thread is stuck in a spin-wait
+    /// and cannot reach the code that signals worker threads.
+    /// </summary>
+    public static Func<int>? ForceWakeBlockedWaiters { get; set; }
+
+    /// <summary>
     /// Fired when a guest thread is torn down without a clean pthread_exit
     /// (e.g. TBB execute-AV → worker_abort). Libs use this to abandon mutexes.
     /// </summary>
@@ -248,7 +257,24 @@ public static class GuestThreadExecution
 
     public static ulong CurrentGuestThreadHandle => _currentGuestThreadHandle;
 
+    public static ulong MediaPumpThreadHandle =>
+        unchecked((ulong)Volatile.Read(ref _mediaPumpThreadHandle));
+
     public static ulong CurrentFiberAddress => _currentFiberAddress;
+
+    public static void PublishMediaPumpThreadHandle(ulong threadHandle)
+    {
+        if (threadHandle != 0)
+        {
+            Interlocked.CompareExchange(
+                ref _mediaPumpThreadHandle,
+                unchecked((long)threadHandle),
+                0);
+        }
+    }
+
+    public static bool IsMediaPumpThread(ulong threadHandle) =>
+        threadHandle != 0 && threadHandle == MediaPumpThreadHandle;
 
     public static ulong EnterGuestThread(ulong threadHandle)
     {

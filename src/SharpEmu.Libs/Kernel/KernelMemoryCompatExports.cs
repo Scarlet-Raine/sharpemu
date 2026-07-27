@@ -1609,6 +1609,23 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        // RAGE/Scaleform in-memory file device: "memory:$<addr>,<size>,<off>:<name>"
+        // describes an asset already resident in guest memory. There is no host
+        // file — treat it as a regular file of <size> bytes so the guest's asset
+        // loader stops re-probing it (GTA V/SA UI + HUD .gfx load this way).
+        if (TryParseMemoryFilePath(guestPath, out _, out var memoryFileSize))
+        {
+            var nowUtc = DateTime.UtcNow;
+            if (TryWriteKernelStat(ctx, statAddress, isDirectory: false, memoryFileSize, nowUtc, nowUtc, nowUtc, guestPath))
+            {
+                LogUniqueStatTrace(guestPath, "<memory>", found: true);
+                ctx[CpuRegister.Rax] = 0;
+                return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
         var hostPath = ResolveGuestPath(guestPath);
         var statCacheKey = GetNegativeStatCacheKey(guestPath);
         if (statCacheKey is not null && IsNegativeStatCached(statCacheKey))
@@ -3130,7 +3147,11 @@ public static partial class KernelMemoryCompatExports
             }
             else
             {
-                reserved = TryReserveGuestVirtualRange(ctx, desiredAddress, length, protection, effectiveAlignment, out mappedAddress);
+                // When the game requests a specific address (requestedAddress != 0)
+                // without the fixed flag, the address typically falls within a prior
+                // sceKernelReserveVirtualRange reservation. Enable backPartialOverlap
+                // so TryBackFixedRange commits the reserved pages instead of failing.
+                reserved = TryReserveGuestVirtualRange(ctx, desiredAddress, length, protection, effectiveAlignment, out mappedAddress, backPartialOverlap: requestedAddress != 0);
             }
             if (ShouldTraceDirectMemory())
             {
@@ -4771,7 +4792,8 @@ public static partial class KernelMemoryCompatExports
         ulong length,
         int protection,
         ulong alignment,
-        out ulong mappedAddress)
+        out ulong mappedAddress,
+        bool backPartialOverlap = false)
     {
         var executable = (protection & OrbisProtCpuExec) != 0;
         return KernelVirtualRangeAllocator.TryReserve(
@@ -4783,7 +4805,8 @@ public static partial class KernelMemoryCompatExports
             allowSearch: true,
             allowAllocateAtAlternative: false,
             "reserve range",
-            out mappedAddress);
+            out mappedAddress,
+            backPartialOverlap: backPartialOverlap);
     }
 
     private static bool TryReserveExactGuestVirtualRange(
@@ -4886,6 +4909,45 @@ public static partial class KernelMemoryCompatExports
         }
 
         return FileMode.Open;
+    }
+
+    // Parses the RAGE in-memory file pseudo-path
+    // "memory:$<hexAddr>,<decSize>,<decOffset>:<name>" (e.g.
+    // "memory:$0x14D4060000,101371,0:00158_hud_reticle.gfx"). Only the declared
+    // byte size is needed to satisfy stat; the payload is already resident in
+    // guest memory at <hexAddr>.
+    private static bool TryParseMemoryFilePath(string guestPath, out ulong address, out long size)
+    {
+        address = 0;
+        size = 0;
+        const string prefix = "memory:$";
+        if (guestPath is null || !guestPath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var rest = guestPath.AsSpan(prefix.Length);
+        var firstComma = rest.IndexOf(',');
+        if (firstComma <= 0)
+        {
+            return false;
+        }
+
+        var addressText = rest[..firstComma];
+        if (addressText.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            addressText = addressText[2..];
+        }
+
+        if (!ulong.TryParse(addressText, System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out address))
+        {
+            return false;
+        }
+
+        var afterAddress = rest[(firstComma + 1)..];
+        var secondComma = afterAddress.IndexOf(',');
+        var sizeText = secondComma >= 0 ? afterAddress[..secondComma] : afterAddress;
+        return long.TryParse(sizeText, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out size) && size >= 0;
     }
 
     public static string ResolveGuestPath(string guestPath)
@@ -5946,6 +6008,11 @@ public static partial class KernelMemoryCompatExports
 
             if (result != (int)OrbisGen2Result.ORBIS_GEN2_OK)
             {
+                // A failed batch entry usually aborts the guest (UE treats any
+                // sceKernelBatchMap error as a LowLevelFatalError), so always
+                // record which entry failed and why before returning it.
+                Console.Error.WriteLine(
+                    $"[LOADER][WARN] batch_map entry failed: index={index} op={entry.Operation} start=0x{entry.Start:X16} offset=0x{entry.Offset:X16} len=0x{entry.Length:X16} prot=0x{entry.Protection:X2} type={entry.Type} result=0x{result:X8}");
                 break;
             }
 
@@ -7251,6 +7318,8 @@ public static partial class KernelMemoryCompatExports
 
         var entryName = directory.Entries[currentIndex];
         directory.NextIndex = currentIndex + 1;
+
+        LogIoTrace("getdents", directory.Path, $"fd={fd} index={currentIndex}/{directory.Entries.Length} entry='{entryName}'");
 
         var entryBytes = Encoding.UTF8.GetBytes(entryName);
         var nameLength = Math.Min(entryBytes.Length, 255);

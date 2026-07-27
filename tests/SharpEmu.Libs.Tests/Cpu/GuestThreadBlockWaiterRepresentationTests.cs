@@ -100,6 +100,25 @@ public sealed class GuestThreadBlockWaiterRepresentationTests
         }
     }
 
+    [Fact]
+    public void MediaPumpPublicationTargetsGuestRipSampler()
+    {
+        GuestThreadExecution.PublishMediaPumpThreadHandle(0x4567);
+
+        Assert.Equal(0x4567UL, GuestThreadExecution.MediaPumpThreadHandle);
+        Assert.True(GuestThreadExecution.IsMediaPumpThread(0x4567));
+        Assert.False(GuestThreadExecution.IsMediaPumpThread(0x1234));
+        Assert.True(DirectExecutionBackend.ShouldArmGuestRipSampler(
+            mediaPumpOnly: true,
+            currentThreadHandle: 0x4567));
+        Assert.False(DirectExecutionBackend.ShouldArmGuestRipSampler(
+            mediaPumpOnly: true,
+            currentThreadHandle: 0x1234));
+        Assert.True(DirectExecutionBackend.ShouldArmGuestRipSampler(
+            mediaPumpOnly: false,
+            currentThreadHandle: 0x1234));
+    }
+
     private static bool IsFuncParameter(Type parameterType)
     {
         var type = parameterType.IsByRef

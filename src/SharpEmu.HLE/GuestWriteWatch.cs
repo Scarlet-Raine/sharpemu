@@ -25,8 +25,16 @@ public static class GuestWriteWatch
 
     private static readonly bool WatchValue1 = IsEnabled("SHARPEMU_WATCH_VALUE1");
 
-    private const ulong DirectBandLow = 0x100_0000_0000;
-    private const ulong DirectBandHigh = 0x1000_0000_0000;
+    private const ulong DefaultBandLow = 0x100_0000_0000;
+    private const ulong DefaultBandHigh = 0x1000_0000_0000;
+
+    // The watched band defaults to the classic direct-memory window but can be
+    // retargeted at the actual guest arena under investigation (for example a
+    // relocated FMallocBinned3 reservation) without a rebuild.
+    private static readonly ulong DirectBandLow = ParseOrDefault(
+        Environment.GetEnvironmentVariable("SHARPEMU_WATCH_BAND_LO"), DefaultBandLow);
+    private static readonly ulong DirectBandHigh = ParseOrDefault(
+        Environment.GetEnvironmentVariable("SHARPEMU_WATCH_BAND_HI"), DefaultBandHigh);
     private static int _value1Reports;
 
     private static readonly bool WatchBulkTorn = IsEnabled("SHARPEMU_WATCH_BULK_TORN");
@@ -182,6 +190,12 @@ public static class GuestWriteWatch
         kind == "torn"
             ? Interlocked.Increment(ref _bulkTornReports) <= MaxBulkReports
             : Interlocked.Increment(ref _bulkShiftReports) <= MaxBulkReports;
+
+    private static ulong ParseOrDefault(string? text, ulong fallback)
+    {
+        var parsed = Parse(text);
+        return parsed != 0 ? parsed : fallback;
+    }
 
     internal static ulong Parse(string? text)
     {

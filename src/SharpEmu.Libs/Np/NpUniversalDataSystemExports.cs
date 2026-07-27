@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using SharpEmu.HLE;
-using System.Buffers.Binary;
 
 namespace SharpEmu.Libs.Np;
 
@@ -13,6 +12,7 @@ public static class NpUniversalDataSystemExports
     private static readonly HashSet<int> _createdEvents = [];
     private static int _nextHandle = 1;
     private static int _nextEvent = 1;
+    private static long _nextContext = 1;
 
     [SysAbiExport(
         Nid = "sjaobBgqeB4",
@@ -46,9 +46,13 @@ public static class NpUniversalDataSystemExports
             return ctx.SetReturn(0, typeof(long));
         }
 
-        Span<byte> context = stackalloc byte[sizeof(int)];
-        BinaryPrimitives.WriteInt32LittleEndian(context, 1);
-        return ctx.Memory.TryWrite(contextAddress, context)
+        // The first argument is a pointer-sized out-slot (callers seed it with
+        // -1 before the call). Writing fewer than 8 bytes leaves a stale high
+        // dword behind; when the slot previously held a heap pointer, the
+        // mangled value later reaches the guest allocator as an invalid free.
+        // Always overwrite the full slot with an opaque nonzero handle.
+        var contextHandle = unchecked((ulong)Interlocked.Increment(ref _nextContext));
+        return ctx.TryWriteUInt64(contextAddress, contextHandle)
             ? ctx.SetReturn(0, typeof(long))
             : ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
     }

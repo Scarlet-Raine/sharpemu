@@ -12,6 +12,9 @@ namespace SharpEmu.Libs.Tests.Agc;
 // listener with a guest-defined eventId. Those two values are not the same numbering scheme, so
 // exact ident matching never wakes anything (issue #173). TriggerRegisteredEventsByFilter wakes
 // every graphics registration instead.
+// The equeue registry is process-global static state, so every test that registers a graphics
+// event shares this collection to serialize against other graphics-equeue tests.
+[Collection("agc-equeue-global-state")]
 public sealed class AgcEventQueueTests
 {
     private const ulong BaseAddress = 0x1_0000_0000;
@@ -70,6 +73,13 @@ public sealed class AgcEventQueueTests
         Assert.Equal(1u, ReadUInt32(memory, eventsAddress + 0x0C));
         Assert.Equal(eventType, ReadUInt64(memory, eventsAddress + 0x10));
         Assert.Equal(userData, ReadUInt64(memory, eventsAddress + 0x18));
+
+        // The registry is global; leaving the queue registered leaks a graphics
+        // registration into every later filter-wide trigger test.
+        ctx[CpuRegister.Rdi] = handle;
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_OK,
+            KernelEventQueueCompatExports.KernelDeleteEqueue(ctx));
     }
 
     [Fact]
@@ -97,6 +107,11 @@ public sealed class AgcEventQueueTests
             0x07);
 
         Assert.Equal(0, triggered);
+
+        ctx[CpuRegister.Rdi] = handle;
+        Assert.Equal(
+            (int)OrbisGen2Result.ORBIS_GEN2_OK,
+            KernelEventQueueCompatExports.KernelDeleteEqueue(ctx));
     }
 
     private static ulong ReadUInt64(FakeCpuMemory memory, ulong address)

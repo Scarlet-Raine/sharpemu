@@ -167,6 +167,8 @@ public static class KernelPthreadCompatExports
 
     static KernelPthreadCompatExports()
     {
+        WatchCondSuffix = ParseWatchCondSuffix(out WatchCondSuffixMask);
+        _forceTriggerNotBefore = Environment.TickCount64 + 20_000;
         RunSynchronizationSelfChecks();
         GuestThreadExecution.GuestThreadAbandoned += AbandonMutexesOwnedByThread;
         GuestThreadExecution.ForceWakeBlockedWaiters = ForceWakeCooperativeWaiters;
@@ -819,6 +821,11 @@ public static class KernelPthreadCompatExports
 
     private static int PthreadMutexLockCore(CpuContext ctx, ulong mutexAddress, bool tryOnly)
     {
+        if (tryOnly)
+        {
+            CountTrylockAttempt();
+        }
+
         if (mutexAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
@@ -851,6 +858,11 @@ public static class KernelPthreadCompatExports
                 var adaptiveResult = tryOnly
                     ? (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY
                     : (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                if (tryOnly)
+                {
+                    TraceTrylockBusyContended(ctx, mutexAddress, state.OwnerThreadId);
+                }
+
                 TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock-idempotent", mutexAddress, resolvedAddress, state, currentThreadId, adaptiveResult);
                 return adaptiveResult;
             }
@@ -859,6 +871,7 @@ public static class KernelPthreadCompatExports
             {
                 if (tryOnly)
                 {
+                    TraceTrylockBusyContended(ctx, mutexAddress, state.OwnerThreadId);
                     TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
                 }
@@ -878,6 +891,7 @@ public static class KernelPthreadCompatExports
             // is not triggered by HLE ownership mismatches.
             if (tryOnly)
             {
+                TraceTrylockBusyContended(ctx, mutexAddress, state.OwnerThreadId);
                 TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
             }
@@ -907,6 +921,7 @@ public static class KernelPthreadCompatExports
                 {
                     if (tryOnly)
                     {
+                        TraceTrylockBusyContended(ctx, mutexAddress, state.OwnerThreadId);
                         TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
                         return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
                     }
@@ -923,6 +938,7 @@ public static class KernelPthreadCompatExports
                 {
                     if (tryOnly)
                     {
+                        TraceTrylockBusyContended(ctx, mutexAddress, state.OwnerThreadId);
                         TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
                         return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
                     }
@@ -943,6 +959,7 @@ public static class KernelPthreadCompatExports
                 // rather than returning EDEADLK which abort()s the game.
                 if (tryOnly)
                 {
+                    TraceTrylockBusyContended(ctx, mutexAddress, state.OwnerThreadId);
                     TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
                     return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
                 }
@@ -969,6 +986,15 @@ public static class KernelPthreadCompatExports
 
             if (tryOnly)
             {
+                // UE 4.26 FScopeTryLock treats a failed trylock as "state
+                // unavailable": in FMixerSourceBuffer a single cross-thread
+                // BUSY at a buffer boundary reads the queue as empty and
+                // permanently kills the source (bIsLastBuffer, no re-arm).
+                // On hardware the hold windows are sub-microsecond; under the
+                // cooperative scheduler a holder can be parked mid-hold for
+                // milliseconds, so real contention here is a wedge suspect
+                // worth tracing (SHARPEMU_TRACE_TRYLOCK_BUSY=1).
+                TraceTrylockBusyContended(ctx, mutexAddress, state.OwnerThreadId);
                 TracePthreadMutex(ctx, "trylock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
             }
@@ -1585,6 +1611,59 @@ public static class KernelPthreadCompatExports
         TraceCondWaitChain(ctx, condAddress, timed, timeoutUsec);
         DumpBridgeCandidate(ctx, condAddress, timed, timeoutUsec);
 
+        // Causality experiment (SHARPEMU_FORCE_TRIGGER_WATCH_COND=1): the
+        // watched pooled FEvent keeps its Triggered flag one qword-pair below
+        // the cond word ({..., bTriggered@-0x10, mutexHandle@-0x08,
+        // condHandle@+0x00}, live-verified pool layout). Setting the flag and
+        // returning a spurious wake makes the parked consumer's predicate
+        // re-check succeed, so it drains its command queue exactly as if the
+        // producer's missing Trigger had arrived. Whether the run then
+        // unwedges decides missed-trigger vs downstream-starvation causality.
+        if (!timed && MatchesCondWatch(condAddress) && ForceTriggerWatchCondEnabled &&
+            Environment.TickCount64 >= _forceTriggerNotBefore)
+        {
+            _forceTriggerNotBefore = Environment.TickCount64 + 50;
+            _ = KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, condAddress - 0x10, 1);
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] cond_watch_force_trigger cond=0x{condAddress:X16} " +
+                $"thread=0x{KernelPthreadState.GetCurrentThreadHandle():X16}");
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
+        // Second-stage causality experiment
+        // (SHARPEMU_FORCE_TRIGGER_POLLER=1): the wedged producer's sub-ms
+        // poll target is latched by the same wait-count heuristic the bridge
+        // dump uses; its pooled-FEvent Triggered flag sits at the same
+        // cond-0x10 slot. Forcing it decides whether the producer is stalled
+        // on a lost buffer-accept trigger or on genuinely-full ring indices.
+        // SHARPEMU_WATCH_POLLER=1 latches the same cond WITHOUT forcing, to
+        // passively watch it and its buffer-accept sibling (cond-0x2D0).
+        if (timed && (ForceTriggerPollerEnabled || WatchPollerEnabled) && timeoutUsec < 1000 &&
+            Volatile.Read(ref _forceTriggerPollerCond) == 0)
+        {
+            var pollWaits = _bridgeWaitCounts.AddOrUpdate(condAddress, 1, static (_, count) => count + 1);
+            if (pollWaits == PollerLatchThreshold)
+            {
+                Volatile.Write(ref _forceTriggerPollerCond, condAddress);
+                _forceTriggerPollerNotBefore = Environment.TickCount64;
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] cond_poller_latched cond=0x{condAddress:X16} " +
+                    $"thread=0x{KernelPthreadState.GetCurrentThreadHandle():X16}");
+            }
+        }
+
+        if (timed && ForceTriggerPollerEnabled &&
+            condAddress == Volatile.Read(ref _forceTriggerPollerCond) &&
+            Environment.TickCount64 >= _forceTriggerPollerNotBefore)
+        {
+            _forceTriggerPollerNotBefore = Environment.TickCount64 + 10;
+            _ = KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, condAddress - 0x10, 1);
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] cond_poller_force_trigger cond=0x{condAddress:X16} " +
+                $"thread=0x{KernelPthreadState.GetCurrentThreadHandle():X16}");
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
         if (!TryResolveCondState(ctx, condAddress, createIfZero: true, out _, out var state))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
@@ -1645,8 +1724,30 @@ public static class KernelPthreadCompatExports
                 state.SignalEpoch > timeoutEpoch)
             {
                 state.TimeoutEpochs.Remove(currentThreadId);
+                if (WatchPollerEnabled && condAddress == Volatile.Read(ref _forceTriggerPollerCond))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] epoch_recovery_fired cond=0x{condAddress:X16} " +
+                        $"thread=0x{currentThreadId:X16} epoch={state.SignalEpoch} was={timeoutEpoch}");
+                }
+
                 TracePthreadCond("wait-epoch-signal", condAddress, mutexAddress, state, timed, (int)OrbisGen2Result.ORBIS_GEN2_OK);
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+            }
+
+            // Diagnostic (watched cond only): sample the epoch state at wait
+            // entry so a run where signals land (queued=0) but MAIN never
+            // recovers reveals WHY — no recorded timeout for this thread
+            // (state-object split) vs epoch not advancing (signal resolves to a
+            // different cond state than this wait).
+            if (WatchPollerEnabled && condAddress == Volatile.Read(ref _forceTriggerPollerCond) &&
+                (Interlocked.Increment(ref _epochProbeCounter) & 0x1FFF) == 0)
+            {
+                var hasEntry = state.TimeoutEpochs is not null &&
+                    state.TimeoutEpochs.ContainsKey(currentThreadId);
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] epoch_probe cond=0x{condAddress:X16} thread=0x{currentThreadId:X16} " +
+                    $"epoch={state.SignalEpoch} has_timeout_entry={hasEntry} waiters={state.WaiterQueue.Count}");
             }
 
             waiter.Node = state.WaiterQueue.AddLast(waiter);
@@ -1721,6 +1822,13 @@ public static class KernelPthreadCompatExports
         var waitResult = waiter.CompletionState == 2
             ? CondTimedOutResult(waiter)
             : (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        if (MatchesCondWatch(condAddress))
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] cond_watch_exit thread=0x{currentThreadId:X16} " +
+                $"cond=0x{condAddress:X16} timedout={waiter.CompletionState == 2} timed={timed}");
+        }
+
         TracePthreadCond(waiter.CompletionState == 2 ? "wait-exit-timeout" : "wait-exit", condAddress, mutexAddress, state, timed, waitResult);
         return waitResult;
     }
@@ -1740,8 +1848,12 @@ public static class KernelPthreadCompatExports
         }
 
         List<PthreadCondWaiter>? completedWaiters = null;
+        var watchThisCond = WatchPollerEnabled && condAddress == Volatile.Read(ref _forceTriggerPollerCond);
+        int queuedAtSignal;
+        int completedThisSignal = 0;
         lock (state.SyncRoot)
         {
+            queuedAtSignal = state.WaiterQueue.Count;
             state.SignalEpoch++;
             for (var node = state.WaiterQueue.First; node is not null;)
             {
@@ -1750,6 +1862,7 @@ public static class KernelPthreadCompatExports
                 if (waiter.CompletionState == 0 && CompleteCondWaiterLocked(state, waiter, timedOut: false))
                 {
                     (completedWaiters ??= new List<PthreadCondWaiter>()).Add(waiter);
+                    completedThisSignal++;
                     if (!broadcast)
                     {
                         break;
@@ -1760,6 +1873,19 @@ public static class KernelPthreadCompatExports
             }
 
             TracePthreadCond(broadcast ? "broadcast" : "signal", condAddress, mutexAddress: 0, state, timed: false, (int)OrbisGen2Result.ORBIS_GEN2_OK);
+        }
+
+        // Lost-wakeup vs empty-queue diagnosis for MAIN's movie-pump cond: log
+        // whether any waiter was actually queued when the signal landed. A
+        // signal that finds ZERO queued waiters is the classic missed-wakeup
+        // window (predicate-set/signal races the waiter's park), which the
+        // guest's edge-triggered FEvent cannot recover; a nonzero queue that
+        // completes a waiter is a healthy wake.
+        if (watchThisCond)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] poller_signal_delivery cond=0x{condAddress:X16} " +
+                $"queued={queuedAtSignal} completed={completedThisSignal} broadcast={broadcast}");
         }
 
         if (completedWaiters is not null)
@@ -2085,6 +2211,7 @@ public static class KernelPthreadCompatExports
                     ? CondTimedOutResult(waiter)
                     : (int)OrbisGen2Result.ORBIS_GEN2_OK)
                 : (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
+        TallyPollerWaitResult(condAddress, waiter.CompletionState);
         TracePthreadCond(
             waiter.CompletionState == 2 ? "wait-resume-timeout" : "wait-resume",
             condAddress,
@@ -2310,6 +2437,12 @@ public static class KernelPthreadCompatExports
 
     private static void TracePthreadMutex(CpuContext ctx, string operation, ulong mutexAddress, ulong resolvedAddress, PthreadMutexState? state, ulong currentThreadId, int result)
     {
+        var latched = Volatile.Read(ref _trylockBusyLatchedMutex);
+        if (latched != 0 && (mutexAddress == latched || resolvedAddress == latched))
+        {
+            TraceLatchedMutexOp(operation, resolvedAddress, state, currentThreadId, result);
+        }
+
         if (!ShouldTracePthreadMutex(mutexAddress, resolvedAddress))
         {
             return;
@@ -2343,6 +2476,206 @@ public static class KernelPthreadCompatExports
             "1",
             StringComparison.Ordinal);
 
+    // SHARPEMU_WATCH_COND_SUFFIX=<hex low bits>: unsampled watch on every
+    // wait entry/exit and signal whose condvar address ends with the given
+    // suffix. The UE FEvent pool base relocates per run, but a specific
+    // pooled event keeps its low-bit offset, so a suffix identifies "the
+    // AudioThread's event" across runs where a full address cannot. The
+    // sampled chain tracers (1/4096 waits, 1/512 signals) miss rare signals
+    // entirely; this watch decides whether a parked consumer's event is
+    // never triggered (guest-side gate) or triggered without a wake
+    // (host-side lost wakeup).
+    private static readonly ulong WatchCondSuffixMask;
+    private static readonly ulong WatchCondSuffix;
+
+    private static readonly bool ForceTriggerWatchCondEnabled =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_FORCE_TRIGGER_WATCH_COND"),
+            "1",
+            StringComparison.Ordinal);
+
+    // Rate limit so the force-triggered consumer becomes a 20 Hz poller
+    // instead of a hot spin; also delays the first injection past startup
+    // so the healthy init-phase handshake is not perturbed. TickCount64 is
+    // uptime-based, so the anchor is set in the static constructor.
+    private static long _forceTriggerNotBefore;
+
+    private static readonly bool ForceTriggerPollerEnabled =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_FORCE_TRIGGER_POLLER"),
+            "1",
+            StringComparison.Ordinal);
+
+    private static ulong _forceTriggerPollerCond;
+    private static long _forceTriggerPollerNotBefore;
+
+    // SHARPEMU_TRACE_TRYLOCK_BUSY=1: log every cross-thread-contended
+    // pthread_mutex_trylock failure with the caller's guest return chain.
+    // Genuine trylock contention is rare on hardware; each hit is a
+    // candidate for the FScopeTryLock one-shot source-kill path.
+    private static readonly bool TraceTrylockBusyEnabled =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_TRACE_TRYLOCK_BUSY"),
+            "1",
+            StringComparison.Ordinal);
+
+    private static int _trylockBusyCount;
+    private static long _trylockAttemptCount;
+    private static ulong _trylockBusyLatchedMutex;
+
+    // Once a same-owner trylock BUSY appears, latch that mutex and log every
+    // subsequent lock/unlock/trylock on it: the trace shows whether an unlock
+    // arrives and fails, arrives on another thread, or never arrives at all
+    // (lost-unlock vs recursion-type diagnosis).
+    private static void TraceLatchedMutexOp(string op, ulong resolvedAddress, PthreadMutexState? state, ulong currentThreadId, int result)
+    {
+        var count = Interlocked.Increment(ref _latchedMutexOpCount);
+        if (count > 100 && (count & 0xFF) != 0)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] latched_mutex_{op} mutex=0x{resolvedAddress:X16} " +
+            $"thread=0x{currentThreadId:X16} owner=0x{state?.OwnerThreadId ?? 0:X16} " +
+            $"rec={state?.RecursionCount ?? -1} type={state?.Type ?? -1} result=0x{unchecked((uint)result):X8} n={count}");
+    }
+
+    private static int _latchedMutexOpCount;
+
+    // Distinguishes "no contended trylocks" from "trylock never reaches the
+    // HLE at all" (libkernel userspace CAS fast path): attempts are counted
+    // at PthreadMutexLockCore entry and reported sparsely.
+    private static void CountTrylockAttempt()
+    {
+        if (!TraceTrylockBusyEnabled)
+        {
+            return;
+        }
+
+        var attempts = Interlocked.Increment(ref _trylockAttemptCount);
+        if (attempts == 1 || attempts == 100 || attempts % 100_000 == 0)
+        {
+            Console.Error.WriteLine($"[LOADER][TRACE] trylock_attempts n={attempts}");
+        }
+    }
+
+    private static void TraceTrylockBusyContended(CpuContext ctx, ulong mutexAddress, ulong ownerThreadId)
+    {
+        if (!TraceTrylockBusyEnabled)
+        {
+            return;
+        }
+
+        var count = Interlocked.Increment(ref _trylockBusyCount);
+        if (Volatile.Read(ref _trylockBusyLatchedMutex) == 0 &&
+            ownerThreadId == KernelPthreadState.GetCurrentThreadHandle())
+        {
+            Volatile.Write(ref _trylockBusyLatchedMutex, mutexAddress);
+            Console.Error.WriteLine($"[LOADER][TRACE] latched_mutex_target mutex=0x{mutexAddress:X16}");
+        }
+
+        if (count > 400 && (count & 0xFF) != 0)
+        {
+            return;
+        }
+
+        // The raw guest mutex word separates a genuinely-held mutex from
+        // stale HLE ownership after a userspace fast-path unlock the HLE
+        // never observed.
+        Span<byte> word = stackalloc byte[sizeof(ulong)];
+        var guestWord = ctx.Memory.TryRead(mutexAddress, word)
+            ? BinaryPrimitives.ReadUInt64LittleEndian(word)
+            : ulong.MaxValue;
+        EmitCondChain(ctx, "trylock_busy", mutexAddress, $"n={count} owner=0x{ownerThreadId:X16} word=0x{guestWord:X16}");
+    }
+
+    // SHARPEMU_WATCH_POLLER=1: passively latch the sub-ms poller cond and log
+    // every signal to it AND to its buffer-accept sibling event (13f: the
+    // bridge object holds two pooled FEvents 0x2D0 apart; the mixer signals
+    // the lower one when it accepts a source buffer). In a wedged run the
+    // timestamp of the LAST sibling signal separates 'mixer stopped
+    // accepting' from 'game stopped submitting'.
+    private static readonly bool WatchPollerEnabled =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_WATCH_POLLER"),
+            "1",
+            StringComparison.Ordinal) ||
+        LiveFunctionExtractor.IsTriggerCaptureEnabled;
+
+    private static readonly long PollerLatchThreshold = ParsePollerLatchThreshold(
+        Environment.GetEnvironmentVariable("SHARPEMU_WATCH_POLLER_THRESHOLD"));
+
+    private static long _pollerWaitOkCount;
+    private static long _pollerWaitTimeoutCount;
+    private static long _epochProbeCounter;
+
+    private static long ParsePollerLatchThreshold(string? value)
+    {
+        return long.TryParse(value, out var requested)
+            ? Math.Clamp(requested, 1024, 1L << 15)
+            : 1L << 15;
+    }
+
+    // The movie-pump glue loop exits on a SIGNALED wait (far branch) and
+    // continues through the deadline check on TIMEOUT (13p live decode), so
+    // the OK:TIMEOUT ratio on the latched poller cond verifies the wedge
+    // shape (expected ~100% timeouts) and catches any spurious completions
+    // we deliver. ~1 line per 2048 completed waits.
+    private static void TallyPollerWaitResult(ulong condAddress, int completionState)
+    {
+        if (!WatchPollerEnabled || condAddress != Volatile.Read(ref _forceTriggerPollerCond))
+        {
+            return;
+        }
+
+        var timeouts = Volatile.Read(ref _pollerWaitTimeoutCount);
+        var oks = Volatile.Read(ref _pollerWaitOkCount);
+        if (completionState == 2)
+        {
+            timeouts = Interlocked.Increment(ref _pollerWaitTimeoutCount);
+        }
+        else
+        {
+            oks = Interlocked.Increment(ref _pollerWaitOkCount);
+        }
+
+        if ((oks + timeouts) % 2048 == 0)
+        {
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] poller_wait_results cond=0x{condAddress:X16} ok={oks} timeout={timeouts}");
+        }
+    }
+
+    private static ulong ParseWatchCondSuffix(out ulong mask)
+    {
+        mask = 0;
+        var raw = Environment.GetEnvironmentVariable("SHARPEMU_WATCH_COND_SUFFIX");
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return 0;
+        }
+
+        var normalized = raw.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? raw[2..] : raw;
+        if (normalized.Length == 0 || normalized.Length > 16 ||
+            !ulong.TryParse(
+                normalized,
+                System.Globalization.NumberStyles.HexNumber,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var suffix))
+        {
+            return 0;
+        }
+
+        mask = normalized.Length == 16 ? ulong.MaxValue : (1UL << (normalized.Length * 4)) - 1;
+        return suffix;
+    }
+
+    private static bool MatchesCondWatch(ulong condAddress)
+    {
+        return WatchCondSuffixMask != 0 && (condAddress & WatchCondSuffixMask) == WatchCondSuffix;
+    }
+
     private static int _condChainSampleCounter;
 
     /// <summary>
@@ -2355,6 +2688,12 @@ public static class KernelPthreadCompatExports
     /// </summary>
     private static void TraceCondWaitChain(CpuContext ctx, ulong condAddress, bool timed, uint timeoutUsec)
     {
+        if (MatchesCondWatch(condAddress))
+        {
+            EmitCondChain(ctx, "cond_watch_wait", condAddress, $"timed={timed} usec={timeoutUsec}");
+            return;
+        }
+
         if (!TraceCondChainsEnabled ||
             (Interlocked.Increment(ref _condChainSampleCounter) & 0xFFF) != 0)
         {
@@ -2379,7 +2718,8 @@ public static class KernelPthreadCompatExports
         string.Equals(
             Environment.GetEnvironmentVariable("SHARPEMU_DUMP_BRIDGE"),
             "1",
-            StringComparison.Ordinal);
+            StringComparison.Ordinal) ||
+        LiveFunctionExtractor.IsEnabled;
 
     private static readonly ConcurrentDictionary<ulong, long> _bridgeWaitCounts = new();
     private static int _bridgeDumpsEmitted;
@@ -2459,6 +2799,9 @@ public static class KernelPthreadCompatExports
                 // actually executed. Dump the live code preceding the first few
                 // guest-code return candidates on the stack so the true call
                 // sites can be diffed against the static database offline.
+                // 13n: the glue region is PER-RUN dynamic (same VA hosts
+                // different code across runs), so the window must be large
+                // enough to contain the whole wait loop in one run's capture.
                 Span<byte> slot = stackalloc byte[sizeof(ulong)];
                 var emitted = 0;
                 ulong previous = 0;
@@ -2477,8 +2820,14 @@ public static class KernelPthreadCompatExports
 
                     previous = value;
                     Console.Error.WriteLine($"[BRIDGE][DUMP] code_at=0x{value:X}");
-                    DumpQwordWindow(ctx, "COD", value - 0x60, 0x80, value);
+                    DumpQwordWindow(ctx, "COD", value - 0x300, 0x400, value);
                     emitted++;
+                }
+
+                if (kind == "POLLER")
+                {
+                    LiveFunctionExtractor.TryCapture(ctx.Memory, frame.ResumeRsp, frame.ReturnRip);
+                    ChaseBridgePollObject(ctx, frame.ResumeRsp);
                 }
             }
         }
@@ -2505,6 +2854,108 @@ public static class KernelPthreadCompatExports
         {
             Console.Error.WriteLine($"[BRIDGE][DUMP] kind=EXTRA base=0x{address:X16}");
             DumpQwordWindow(ctx, "EXT", address, 0x80, address);
+        }
+    }
+
+    // SHARPEMU_DUMP_BRIDGE_CHASE=1: one-roll pointer chase from the wedged
+    // poller's stack to the poll object's wait method. The glue frame keeps
+    // the poll object at [rbp-0x78] and the wait is a virtual call through
+    // its vtbl+0x20 (13o live decode); the glue code region is per-run
+    // dynamic, so the object, vtable, and method bytes must all come from
+    // the same run as the stack — hence one chained dump.
+    private static readonly bool DumpBridgeChaseEnabled =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_DUMP_BRIDGE_CHASE"),
+            "1",
+            StringComparison.Ordinal);
+
+    private static void ChaseBridgePollObject(CpuContext ctx, ulong resumeRsp)
+    {
+        if (!DumpBridgeChaseEnabled)
+        {
+            return;
+        }
+
+        // Locate the glue frame: the first stack pair of {saved rbp inside
+        // the local stack window, return address in guest text}.
+        Span<byte> slot = stackalloc byte[sizeof(ulong)];
+        ulong framePointer = 0;
+        ulong frameReturn = 0;
+        for (ulong offset = 0; offset + 8 < 0x400; offset += 8)
+        {
+            if (!ctx.Memory.TryRead(resumeRsp + offset, slot))
+            {
+                return;
+            }
+
+            var candidate = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+            if (candidate <= resumeRsp || candidate >= resumeRsp + 0x8000)
+            {
+                continue;
+            }
+
+            if (!ctx.Memory.TryRead(resumeRsp + offset + 8, slot))
+            {
+                return;
+            }
+
+            var returnCandidate = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+            if (returnCandidate is > 0x8_0000_0000 and < 0x8_8000_0000)
+            {
+                framePointer = candidate;
+                frameReturn = returnCandidate;
+                break;
+            }
+        }
+
+        if (framePointer == 0 || !ctx.Memory.TryRead(framePointer - 0x78, slot))
+        {
+            return;
+        }
+
+        var pollObject = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+        Console.Error.WriteLine(
+            $"[BRIDGE][DUMP] kind=CHASE rbp=0x{framePointer:X16} ret=0x{frameReturn:X} obj=0x{pollObject:X16}");
+
+        // The concrete wait implementation hides behind forwarding thunks
+        // (`mov rdi,[rdi+0x10]; jmp [vtbl+0x20]`), so follow up to three
+        // wrapper levels, dumping each object/vtable/method window.
+        for (var level = 0; level < 3 && pollObject != 0; level++)
+        {
+            DumpQwordWindow(ctx, $"OBJ{level + 2}", pollObject - 0x40, 0x140, pollObject);
+            if (!ctx.Memory.TryRead(pollObject, slot))
+            {
+                return;
+            }
+
+            var vtable = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+            Console.Error.WriteLine($"[BRIDGE][DUMP] kind=CHASE level={level} vtbl=0x{vtable:X16}");
+            DumpQwordWindow(ctx, $"VT{level + 2}", vtable, 0x80, vtable);
+            if (!ctx.Memory.TryRead(vtable + 0x20, slot))
+            {
+                return;
+            }
+
+            var waitMethod = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+            Console.Error.WriteLine($"[BRIDGE][DUMP] kind=CHASE level={level} wait_fn=0x{waitMethod:X16}");
+            DumpQwordWindow(ctx, $"FN{level + 2}", waitMethod, 0x600, waitMethod);
+
+            // push rbp; mov rbp,rsp; mov rdi,[rdi+0x10] — the forwarding
+            // thunk prologue; anything else is the real implementation.
+            Span<byte> prologue = stackalloc byte[8];
+            if (!ctx.Memory.TryRead(waitMethod, prologue) ||
+                !prologue.SequenceEqual((ReadOnlySpan<byte>)new byte[] { 0x55, 0x48, 0x89, 0xE5, 0x48, 0x8B, 0x7F, 0x10 }))
+            {
+                return;
+            }
+
+            if (!ctx.Memory.TryRead(pollObject + 0x10, slot))
+            {
+                return;
+            }
+
+            pollObject = BinaryPrimitives.ReadUInt64LittleEndian(slot);
+            Console.Error.WriteLine($"[BRIDGE][DUMP] kind=CHASE level={level} inner_obj=0x{pollObject:X16}");
         }
     }
 
@@ -2549,6 +3000,37 @@ public static class KernelPthreadCompatExports
     /// </summary>
     private static void TraceCondSignalChain(CpuContext ctx, ulong condAddress, bool broadcast)
     {
+        if (MatchesCondWatch(condAddress))
+        {
+            EmitCondChain(ctx, "cond_watch_signal", condAddress, $"broadcast={broadcast}");
+            return;
+        }
+
+        if (WatchPollerEnabled)
+        {
+            var latched = Volatile.Read(ref _forceTriggerPollerCond);
+            if (latched != 0 && (condAddress == latched || condAddress == latched - 0x2D0))
+            {
+                if (condAddress == latched &&
+                    LiveFunctionExtractor.IsTriggerCaptureEnabled &&
+                    GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame))
+                {
+                    LiveFunctionExtractor.TryCapture(
+                        ctx.Memory,
+                        frame.ResumeRsp,
+                        frame.ReturnRip,
+                        LiveFunctionExtractor.TriggerSignalCaptureKind);
+                }
+
+                EmitCondChain(
+                    ctx,
+                    "cond_poller_signal",
+                    condAddress,
+                    $"kind={(condAddress == latched ? "poller" : "sibling")} broadcast={broadcast}");
+                return;
+            }
+        }
+
         if (!TraceCondChainsEnabled ||
             (Interlocked.Increment(ref _condSignalSampleCounter) & 0x1FF) != 0)
         {

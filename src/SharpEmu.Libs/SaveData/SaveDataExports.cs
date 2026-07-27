@@ -896,11 +896,23 @@ public static class SaveDataExports
 
         // A small RDX value is a flag, and RCX contains the output address.
         // A larger RDX value is the output address for the older ABI.
+        // The resource out-slot is pointer-sized: titles treat the stored value
+        // as an object pointer (Demon's Souls dereferences [resource + 8]; GTA SA
+        // DE hands it to the allocator's free path). A 4-byte handle write leaves
+        // a stale high dword behind, turning a previous heap pointer into a
+        // mangled address that later crashes the guest allocator. Always
+        // overwrite the full 8-byte slot with the zero-extended handle.
         var resourceAddress = 0UL;
         var selectedAddress = SelectTransactionResourceAddress(
             ctx[CpuRegister.Rdx],
             ctx[CpuRegister.Rcx]);
-        if (selectedAddress != 0 && TryWriteUInt32(ctx, selectedAddress, id))
+        // Guard: if the selected output address matches a TLS value for the current
+        // thread (e.g. the FMallocBinned2 per-thread cache at TLS key 8), the game
+        // passed a stale/wrong pointer. Writing there would corrupt per-thread
+        // allocator state and wedge the game thread. Skip the write.
+        if (selectedAddress != 0 &&
+            !KernelPthreadExtendedCompatExports.IsCurrentThreadTlsValue(selectedAddress) &&
+            ctx.TryWriteUInt64(selectedAddress, id))
         {
             resourceAddress = selectedAddress;
         }

@@ -69,6 +69,10 @@ public static class AvPlayerExports
         public ulong AudioBufferBase { get; set; }
         public int NextAudioBuffer { get; set; }
         public long NextAudioFrameIndex { get; set; }
+        // First decoded audio frame already sits in RawAudioFrame (filled by
+        // the Start-time warm-up); the next GetAudioData consumes it without
+        // touching the decoder pipe.
+        public bool AudioFramePrimed { get; set; }
 
         public void Dispose()
         {
@@ -301,12 +305,32 @@ public static class AvPlayerExports
             player.PlaybackClock.Start();
             player.LastPumpTimestamp = Stopwatch.GetTimestamp();
             Trace($"start handle=0x{player.Handle:X16}");
+
+            if (PrebufferEnabled)
+            {
+                // Warm the audio decoder off-thread in the gap between Start
+                // and the title's first GetAudioData pull, so frame 0 has no
+                // ffmpeg spin-up stall on the guest media pump
+                // (SHARPEMU_AVPLAYER_PREBUFFER=1 experiment).
+                _ = System.Threading.Tasks.Task.Run(() => PrebufferAudio(player));
+            }
+
+            if (SkipMovies)
+            {
+                // Immediately transition to end-of-stream so the title
+                // proceeds past intro movies without pumping frames.
+                player.EndOfStream = true;
+                player.PlaybackClock.Stop();
+                Console.Error.WriteLine(
+                    $"[AVPLAYER][INFO] skip_movie handle=0x{player.Handle:X16} " +
+                    $"source='{player.SourcePath}'");
+            }
         }
 
         // Event callbacks are guest code and can immediately query the player.
         // Never hold StateGate while waiting for one or the callback deadlocks
         // when it re-enters an AvPlayer export on another guest worker.
-        NotifyEvent(ctx, player, 3); // StatePlay
+        NotifyEvent(ctx, player, SkipMovies ? 1UL : 3UL); // StateStop if skipping, else StatePlay
         return SetReturn(ctx, 0);
     }
 
@@ -568,6 +592,8 @@ public static class AvPlayerExports
         LibraryName = "libSceAvPlayer")]
     public static int AvPlayerGetAudioData(CpuContext ctx)
     {
+        GuestThreadExecution.PublishMediaPumpThreadHandle(
+            GuestThreadExecution.CurrentGuestThreadHandle);
         PlayerState? endedPlayer = null;
         var result = GetAudioDataLocked(ctx, ref endedPlayer);
         if (endedPlayer is not null)
@@ -605,8 +631,24 @@ public static class AvPlayerExports
             const int channelCount = 2;
             const int sampleRate = 48_000;
             const int audioFrameSize = samplesPerFrame * channelCount * sizeof(short);
-            if (player.RawAudioFrame is null ||
-                !ReadExactly(player.AudioDecoderOutput, player.RawAudioFrame))
+            // The decoder pipe read below is synchronous on the guest thread
+            // AND under StateGate: any decoder spin-up or starvation stall
+            // here freezes the whole media pump. Surface stalls >10 ms so
+            // wedged rolls can be correlated with delivery gaps.
+            var pumpReadStart = Stopwatch.GetTimestamp();
+            var rawFrameAvailable = player.RawAudioFrame is not null &&
+                (player.AudioFramePrimed ||
+                 ReadExactly(player.AudioDecoderOutput, player.RawAudioFrame));
+            player.AudioFramePrimed = false;
+            var pumpReadMs = Stopwatch.GetElapsedTime(pumpReadStart).TotalMilliseconds;
+            if (pumpReadMs > 10)
+            {
+                Console.Error.WriteLine(
+                    $"[AVPLAYER][WARN] audio_pipe_stall ms={pumpReadMs:F1} " +
+                    $"handle=0x{player.Handle:X16} frame={player.NextAudioFrameIndex} ok={rawFrameAvailable}");
+            }
+
+            if (!rawFrameAvailable)
             {
                 // Audio pipe drained (or decoder never produced a frame
                 // buffer). Mark the stream ended so the natural content end
@@ -1016,6 +1058,46 @@ public static class AvPlayerExports
         }
     }
 
+    // SHARPEMU_AVPLAYER_PREBUFFER=1: spawn the audio decoder and decode the
+    // first frame at Start instead of on the title's first GetAudioData.
+    // Hardware AvPlayer prerolls between Start and the first frame pull; our
+    // lazy spawn put a ~50 ms ffmpeg spin-up stall on the guest media pump
+    // right when the UE mixer source is most underrun-sensitive.
+    private static readonly bool PrebufferEnabled =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_AVPLAYER_PREBUFFER"),
+            "1",
+            StringComparison.Ordinal);
+
+    private static void PrebufferAudio(PlayerState player)
+    {
+        lock (StateGate)
+        {
+            if (!player.Started || player.Paused || player.SourcePath is null)
+            {
+                return;
+            }
+
+            if (!player.AudioFramePrimed && EnsureAudioDecoder(player) &&
+                player.RawAudioFrame is not null &&
+                ReadExactly(player.AudioDecoderOutput, player.RawAudioFrame))
+            {
+                player.AudioFramePrimed = true;
+                Trace($"audio_prebuffered handle=0x{player.Handle:X16}");
+            }
+
+            // Warm the video decoder too: its first pipe read carries the
+            // ffprobe+ffmpeg spin-up (~100 ms) that otherwise lands on the
+            // guest media pump. The frame itself is not pre-consumed; the
+            // pump's frame pacing (NextFrameIndex vs PlaybackClock) is
+            // unaffected.
+            if (EnsureDecoder(player))
+            {
+                Trace($"video_predecoder_ready handle=0x{player.Handle:X16}");
+            }
+        }
+    }
+
     private static bool EnsureAudioDecoder(PlayerState player)
     {
         if (player.AudioDecoderOutput is not null)
@@ -1093,7 +1175,17 @@ public static class AvPlayerExports
 
         try
         {
-            return ReadExactly(player.DecoderOutput, player.RawFrame);
+            var readStart = Stopwatch.GetTimestamp();
+            var ok = ReadExactly(player.DecoderOutput, player.RawFrame);
+            var readMs = Stopwatch.GetElapsedTime(readStart).TotalMilliseconds;
+            if (readMs > 10)
+            {
+                Console.Error.WriteLine(
+                    $"[AVPLAYER][WARN] video_pipe_stall ms={readMs:F1} " +
+                    $"handle=0x{player.Handle:X16} ok={ok}");
+            }
+
+            return ok;
         }
         catch (IOException exception)
         {
@@ -1993,6 +2085,18 @@ public static class AvPlayerExports
             "1",
             StringComparison.Ordinal);
 
+    /// <summary>
+    /// When set (SHARPEMU_AVPLAYER_SKIP=1), AvPlayerStart immediately
+    /// transitions to end-of-stream so the title skips intro movies.
+    /// Works around the ~4/5 startup wedge where the UE AudioMixer
+    /// virtualizes the movie source during the first engine ticks.
+    /// </summary>
+    private static readonly bool SkipMovies =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_AVPLAYER_SKIP"),
+            "1",
+            StringComparison.Ordinal);
+
     private static void TryLocateMediaPumpObject(CpuContext ctx, ulong lastDeliveredMilliseconds)
     {
         // ts=0/21 frames make the signature non-distinctive (everything
@@ -2165,6 +2269,27 @@ public static class AvPlayerExports
                 !targets.Exists(t => value - (t & ~0xFFFUL) < 0x8000))
             {
                 targets.Add(value);
+            }
+        }
+
+        // SHARPEMU_DUMP_MEDIA_PUMP_EXTRA: comma-separated guest code addresses
+        // to capture in addition to the stack-derived targets. Used for
+        // load-patched glue regions whose static bytes are unrelated code
+        // (e.g. the RAGE movie-audio wait glue around 0x802385Dxx).
+        var extra = Environment.GetEnvironmentVariable("SHARPEMU_DUMP_MEDIA_PUMP_EXTRA");
+        if (!string.IsNullOrWhiteSpace(extra))
+        {
+            foreach (var token in extra.Split(new[] { ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                var normalized = token.StartsWith("0x", StringComparison.OrdinalIgnoreCase) ? token[2..] : token;
+                if (ulong.TryParse(
+                        normalized,
+                        System.Globalization.NumberStyles.HexNumber,
+                        System.Globalization.CultureInfo.InvariantCulture,
+                        out var address))
+                {
+                    targets.Add(address);
+                }
             }
         }
 

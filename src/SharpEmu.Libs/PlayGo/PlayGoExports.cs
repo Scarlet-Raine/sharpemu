@@ -730,6 +730,14 @@ public static class PlayGoExports
     // pakchunk<N>-<platform>.pak files on disk. Chunk 0 is always included: it
     // is the base chunk and must resolve even for a title with no pak files at
     // all (which keeps the single-chunk behaviour for such titles).
+    //
+    // Only report chunks that actually exist on disk. Titles query
+    // scePlayGoGetLocus for chunk ids defined in their internal configuration;
+    // returning BAD_CHUNK_ID for absent chunks is the correct behaviour and
+    // titles handle it gracefully (verified: GTA SA:DE queries chunks 1 and 16,
+    // gets BAD_CHUNK_ID, and proceeds to render 86+ DCBs normally). Reporting
+    // phantom chunks as available causes titles to attempt loading content that
+    // does not exist in the pak, stalling the task graph indefinitely.
     private static ushort[] DiscoverInstalledChunkIds(string app0Root)
     {
         var ids = new SortedSet<ushort> { 0 };

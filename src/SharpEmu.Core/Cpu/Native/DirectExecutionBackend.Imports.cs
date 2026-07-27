@@ -325,17 +325,46 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine(
 				$"[LOADER][TRACE] bootstrap_call#{num}: op=0x{value:X16} sym_ptr=0x{value2:X16} sym='{symbolText}' out_ptr=0x{num3:X16} ret=0x{num7:X16}");
 		}
-		if (!isGuestWorker &&
-			!ActiveForcedGuestExit &&
-			ShouldForceGuestExitOnImportLoop(in importStubEntry, num7, num, value, value2))
+		if (!ActiveForcedGuestExit &&
+			DetectImportLoopPattern(in importStubEntry, num7, num, value, value2))
 		{
 			// Break before the forced exit so the loop state is still live.
 			NotifyDebuggerStall(CpuStallKind.ImportLoop, in importStubEntry, num7, num, value, value2);
-			if (TryForceGuestExitToHostStub(argPackPtr, num, num7, importStubEntry.Nid))
+			if (isGuestWorker)
 			{
-				cpuContext[CpuRegister.Rax] = 1uL;
-				*(ulong*)(argPackPtr + ImportSavedRaxOffset) = 1uL;
-				return 1uL;
+				// Guest threads yield back to the scheduler once the loop
+				// has persisted past the time threshold.  This lets the
+				// ready-dispatch thread run other guest threads (e.g.
+				// blocked workers woken by the force-wake timer) while the
+				// spinning thread waits for its next time-slice.
+				if (ImportLoopExceedsTimeThreshold() &&
+					TryYieldGuestThreadToHostStub(argPackPtr, num, num7, importStubEntry.Nid, "import_loop_guard"))
+				{
+					cpuContext[CpuRegister.Rax] = 1uL;
+					*(ulong*)(argPackPtr + ImportSavedRaxOffset) = 1uL;
+					return 1uL;
+				}
+			}
+			else
+			{
+				// Main thread: yield to the scheduler once the loop has persisted
+				// past the time threshold.  A previous revision unconditionally
+				// reset the detector here ("do NOT sleep — the task-graph spin is
+				// timing-sensitive"), but that lets a gettimeofday busy-poll
+				// monopolise the CPU indefinitely and starve the guest workers
+				// whose completion the spin is waiting for (~50 % wedge rate on
+				// GTA SA:DE).  The 5 s threshold is well above any normal
+				// task-graph drain (sub-millisecond on real hardware), so this
+				// only fires when the spin is genuinely stuck.
+				if (ImportLoopExceedsTimeThreshold() &&
+					TryYieldGuestThreadToHostStub(argPackPtr, num, num7, importStubEntry.Nid, "import_loop_guard_main"))
+				{
+					cpuContext[CpuRegister.Rax] = 1uL;
+					*(ulong*)(argPackPtr + ImportSavedRaxOffset) = 1uL;
+					return 1uL;
+				}
+
+				ResetImportLoopPattern();
 			}
 		}
 		bool flag0 = importStubEntry.SuppressStrlenTrace;
@@ -1476,11 +1505,15 @@ public sealed partial class DirectExecutionBackend
 			string.Equals(nid, "fzyMKs9kim0", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT;
 		var expectedMutexTrylockBusy =
-			string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) &&
+			(string.Equals(nid, "K-jXhbt2gn4", StringComparison.Ordinal) ||
+			 string.Equals(nid, "upoVrzMHFeE", StringComparison.Ordinal)) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
 		var expectedSemaphoreTrywaitAgain =
 			string.Equals(nid, "H2a+IN9TP0E", StringComparison.Ordinal) &&
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_TRY_AGAIN;
+		var expectedPollSemaBusy =
+			string.Equals(nid, "12wOHk8ywb0", StringComparison.Ordinal) &&
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
 		var expectedNetAcceptWouldBlock =
 			string.Equals(nid, "PIWqhn9oSxc", StringComparison.Ordinal) &&
 			resultValue == unchecked((int)0x80410123);
@@ -1495,6 +1528,7 @@ public sealed partial class DirectExecutionBackend
 			!expectedEqueueTimeout &&
 			!expectedMutexTrylockBusy &&
 			!expectedSemaphoreTrywaitAgain &&
+			!expectedPollSemaBusy &&
 			!expectedNetAcceptWouldBlock &&
 			!expectedUserServiceNoEvent &&
 			!expectedPrivacyInvalidParameter)
@@ -1610,7 +1644,6 @@ public sealed partial class DirectExecutionBackend
 			"en7gNVnh878" or // sceSaveDataDialogIsReadyToDisplay
 			"jO8DM8oyego" or // sceNpEntitlementAccessInitialize
 			"TFyU+KFBv54" or // sceNpEntitlementAccessGetAddcontEntitlementInfoList
-			"27bAgiJmOh0" or // pthread_cond_timedwait
 			"iQw3iQPhvUQ" or // sceNetCtlCheckCallback
 			"Q2V+iqvjgC0" or // vsnprintf
 			"j4ViWNHEgww" or // strlen
@@ -1634,6 +1667,13 @@ public sealed partial class DirectExecutionBackend
 			// rwlock rd/wr lock removed (can block); init/destroy/unlock stay.
 			"aI+OeCz8xrQ" or // scePthreadSelf
 			"EotR8a3ASf4" or // pthread_self
+			// UE5's FPlatformTLS::GetCurrentThreadId maps to getthreadid; GTA
+			// SA:DE issues it for ~84% of all imports during loading (152M of
+			// 183M dispatches in a 7-minute run), so the full dispatch
+			// bookkeeping dominated the load phase. Pure register write —
+			// cannot park or touch guest memory.
+			"EI-5-jlq2dE" or // scePthreadGetthreadid
+			"3eqs37G74-s" or // pthread_getthreadid_np
 			"eoht7mQOCmo" or // scePthreadGetspecific
 			"0-KXaS70xy4" or // pthread_getspecific
 			"+BzXYkqYeLE" or // scePthreadSetspecific
@@ -1759,7 +1799,12 @@ public sealed partial class DirectExecutionBackend
 			ActiveCpuContext.TryWriteUInt64(returnSlotAddress, hostExit);
 	}
 
-	private bool ShouldForceGuestExitOnImportLoop(in ImportStubEntry entry, ulong returnRip, long dispatchIndex, ulong arg0, ulong arg1)
+	/// <summary>
+	/// Records the import signature and returns true when a repeating loop
+	/// pattern is confirmed (≥6 consecutive hits).  Does NOT apply the
+	/// time gate — callers decide whether to throttle or force-exit.
+	/// </summary>
+	private bool DetectImportLoopPattern(in ImportStubEntry entry, ulong returnRip, long dispatchIndex, ulong arg0, ulong arg1)
 	{
 		if (dispatchIndex < 1200)
 		{
@@ -1772,8 +1817,111 @@ public sealed partial class DirectExecutionBackend
 		if (entry.IsLoopGuardBoundary)
 		{
 			ResetImportLoopPattern();
+			_tlsNidStreakCount = 0;
+			_tlsNidStreakStartTimestamp = 0;
+			_tlsImportRateCount = 0;
+			_tlsImportRateWindowStart = 0;
 			return false;
 		}
+
+		// Per-thread NID streak: detects a single thread calling the same
+		// import in a tight loop.  Unlike the shared signature buffer below
+		// (which is diluted by imports from other threads), [ThreadStatic]
+		// counters are immune to cross-thread interleaving.  This reliably
+		// catches the main thread's scePthreadGetthreadid busy-poll during a
+		// UE4 task-graph drain wedge (~50 % of GTA SA:DE launches).
+		var nidHash = entry.NidHash;
+		if (nidHash == _tlsNidStreakNidHash)
+		{
+			_tlsNidStreakCount++;
+		}
+		else
+		{
+			_tlsNidStreakNidHash = nidHash;
+			_tlsNidStreakCount = 1;
+			_tlsNidStreakStartTimestamp = 0;
+		}
+
+		if (_tlsNidStreakCount >= 500_000)
+		{
+			if (_tlsNidStreakStartTimestamp == 0)
+			{
+				_tlsNidStreakStartTimestamp = Stopwatch.GetTimestamp();
+			}
+
+			var elapsed = Stopwatch.GetTimestamp() - _tlsNidStreakStartTimestamp;
+			if (elapsed >= (long)_importLoopGuardSeconds * Stopwatch.Frequency)
+			{
+				// Synchronise the shared timestamp so the caller's
+				// ImportLoopExceedsTimeThreshold() also passes.
+				if (_importLoopPatternStartTimestamp == 0)
+				{
+					_importLoopPatternStartTimestamp = _tlsNidStreakStartTimestamp;
+				}
+
+				if (_nidStreakThrottleLogCount < 8)
+				{
+					_nidStreakThrottleLogCount++;
+					Console.Error.WriteLine(
+						$"[LOADER][INFO] import_loop_nid_streak " +
+						$"thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+						$"nid={entry.Nid} count={_tlsNidStreakCount} " +
+						$"elapsed_s={elapsed / (double)Stopwatch.Frequency:F1}");
+				}
+
+				return true;
+			}
+		}
+
+		// Per-thread import rate: catches busy-poll loops that call multiple
+		// different NIDs (e.g. gettimeofday + scePthreadGetthreadid +
+		// scePthreadMutexLock in a UE4 task-graph drain).  The single-NID
+		// streak above never accumulates for such loops because the NID
+		// changes every few iterations.  A sustained rate >200K imports/s
+		// for the guard threshold is a strong busy-poll indicator — normal
+		// game code dispatches imports at <50K/s per thread.
+		_tlsImportRateCount++;
+		if (_tlsImportRateWindowStart == 0)
+		{
+			_tlsImportRateWindowStart = Stopwatch.GetTimestamp();
+		}
+		else
+		{
+			var rateElapsed = Stopwatch.GetTimestamp() - _tlsImportRateWindowStart;
+			if (rateElapsed >= (long)_importLoopGuardSeconds * Stopwatch.Frequency)
+			{
+				if (_tlsImportRateCount >= 1_000_000)
+				{
+					// Sustained high rate for the full guard window.
+					if (_importLoopPatternStartTimestamp == 0)
+					{
+						_importLoopPatternStartTimestamp = _tlsImportRateWindowStart;
+					}
+
+					if (_nidStreakThrottleLogCount < 8)
+					{
+						_nidStreakThrottleLogCount++;
+						Console.Error.WriteLine(
+							$"[LOADER][INFO] import_loop_rate " +
+							$"thread=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+							$"count={_tlsImportRateCount} " +
+							$"rate_per_s={_tlsImportRateCount / (rateElapsed / (double)Stopwatch.Frequency):F0} " +
+							$"elapsed_s={rateElapsed / (double)Stopwatch.Frequency:F1}");
+					}
+
+					// Reset the window so the next trigger requires another
+					// full window of sustained high rate.
+					_tlsImportRateCount = 0;
+					_tlsImportRateWindowStart = Stopwatch.GetTimestamp();
+					return true;
+				}
+
+				// Rate below threshold — reset the window.
+				_tlsImportRateCount = 0;
+				_tlsImportRateWindowStart = Stopwatch.GetTimestamp();
+			}
+		}
+
 		var value = entry.NidHash;
 		RecordImportLoopSignature(value, returnRip, BuildImportLoopSignature(value, returnRip, arg0, arg1));
 		// The O(period x repeats) pattern scan is a boot/hang watchdog, not a
@@ -1801,7 +1949,16 @@ public sealed partial class DirectExecutionBackend
 			_importLoopPatternStartTimestamp = Stopwatch.GetTimestamp();
 		}
 		_importLoopPatternHits++;
-		if (_importLoopPatternHits < 6)
+		return _importLoopPatternHits >= 6;
+	}
+
+	/// <summary>
+	/// True when the detected loop pattern has persisted for at least
+	/// <see cref="_importLoopGuardSeconds"/> seconds.
+	/// </summary>
+	private bool ImportLoopExceedsTimeThreshold()
+	{
+		if (_importLoopPatternStartTimestamp == 0)
 		{
 			return false;
 		}
@@ -1862,6 +2019,30 @@ public sealed partial class DirectExecutionBackend
 		{
 			return false;
 		}
+
+		// Dominant-NID fallback: a single import NID accounting for the vast
+		// majority of recent samples indicates a spin loop even when the
+		// exact signature varies (different arguments or return sites within
+		// the same tight loop).  This catches task-graph drain loops that
+		// call scePthreadGetspecific from multiple call sites.
+		if (HasDominantNidImportLoop(num))
+		{
+			return true;
+		}
+
+		// Short-period loops (1–5): tight spin-waits that call the same import
+		// with identical arguments every iteration.  Require a higher repeat
+		// count than longer periods to avoid false positives during normal
+		// boot-time initialization bursts.
+		int shortMax = Math.Min(5, num / 16);
+		for (int i = 1; i <= shortMax; i++)
+		{
+			if (HasRepeatingImportLoopPattern(i, 16))
+			{
+				return true;
+			}
+		}
+
 		int num2 = Math.Min(48, num / 4);
 		for (int i = 6; i <= num2; i++)
 		{
@@ -1871,6 +2052,75 @@ public sealed partial class DirectExecutionBackend
 			}
 		}
 		return false;
+	}
+
+	/// <summary>
+	/// Returns true when a single NID hash dominates the recent sample window
+	/// (≥90% of the last <paramref name="sampleCount"/> samples).  This is a
+	/// weaker but more robust loop indicator than exact signature matching:
+	/// a task-graph drain loop may call the same import from several call
+	/// sites with varying arguments, producing many distinct signatures that
+	/// all share one NID.
+	/// </summary>
+	private bool HasDominantNidImportLoop(int sampleCount)
+	{
+		int window = Math.Min(sampleCount, 128);
+		if (window < 96)
+		{
+			return false;
+		}
+
+		// Two-pass approach: first find the most frequent NID, then verify
+		// its dominance.  This handles windows with many distinct NIDs where
+		// one still dominates (e.g. 95% scePthreadGetspecific + 5% misc).
+		ulong dominantNid = GetImportLoopValueFromTail(_importLoopNidHashes, 0);
+		int dominantCount = 0;
+		for (int i = 0; i < window; i++)
+		{
+			ulong nid = GetImportLoopValueFromTail(_importLoopNidHashes, i);
+			if (nid == dominantNid)
+			{
+				dominantCount++;
+			}
+		}
+
+		// If the first NID isn't dominant, try to find the actual dominant one.
+		if (dominantCount * 10 < window * 9)
+		{
+			// Scan for a NID that appears >=90% of the time.
+			bool found = false;
+			for (int i = 0; i < window && !found; i++)
+			{
+				ulong candidate = GetImportLoopValueFromTail(_importLoopNidHashes, i);
+				if (candidate == dominantNid)
+				{
+					continue; // Already checked.
+				}
+				int count = 0;
+				for (int j = 0; j < window; j++)
+				{
+					if (GetImportLoopValueFromTail(_importLoopNidHashes, j) == candidate)
+					{
+						count++;
+					}
+				}
+				if (count * 10 >= window * 9)
+				{
+					dominantNid = candidate;
+					dominantCount = count;
+					found = true;
+				}
+			}
+			if (!found)
+			{
+				return false;
+			}
+		}
+
+		// Require at most 4 distinct return addresses (a tight loop may have
+		// a few call sites but not dozens).
+		int distinctRets = CountDistinctImportLoopValuesFromTail(_importLoopReturnRips, window, 5);
+		return distinctRets <= 4;
 	}
 
 	private bool HasRepeatingImportLoopPattern(int period, int repeats)
