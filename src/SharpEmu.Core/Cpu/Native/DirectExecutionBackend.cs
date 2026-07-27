@@ -2920,8 +2920,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int hostPauseJump = offset;
 		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4D);
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11); // lock cmpxchg [r9], r10
+		EmitLockCmpxchgR9WithR10(code, ref offset); // lock cmpxchg [r9], r10
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int hostRetryJump = offset;
 		EmitUInt32(code, ref offset, 0u);
@@ -3003,8 +3002,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int guestPauseJump = offset;
 		EmitUInt32(code, ref offset, 0u);
-		EmitByte(code, ref offset, 0xF0); EmitByte(code, ref offset, 0x4D);
-		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0xB1); EmitByte(code, ref offset, 0x11);
+		EmitLockCmpxchgR9WithR10(code, ref offset); // lock cmpxchg [r9], r10
 		EmitByte(code, ref offset, 0x0F); EmitByte(code, ref offset, 0x85);
 		int guestRetryJump = offset;
 		EmitUInt32(code, ref offset, 0u);
@@ -6006,6 +6004,19 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static unsafe void EmitByte(byte* code, ref int offset, byte value)
 	{
 		code[offset++] = value;
+	}
+
+	// Emits `lock cmpxchg [r9], r10` (F0 4D 0F B1 11). The REX prefix MUST be
+	// 0x4D: REX.W|REX.R|REX.B. REX.B selects r9 (not rcx) as the memory operand
+	// base, and REX.R selects r10 as the source. Dropping REX.B (0x4C) silently
+	// retargets the CAS at [rcx] — see EmitVehManagedEntryLockAcquire callers.
+	internal static unsafe void EmitLockCmpxchgR9WithR10(byte* code, ref int offset)
+	{
+		EmitByte(code, ref offset, 0xF0);
+		EmitByte(code, ref offset, 0x4D);
+		EmitByte(code, ref offset, 0x0F);
+		EmitByte(code, ref offset, 0xB1);
+		EmitByte(code, ref offset, 0x11);
 	}
 
 	private static unsafe void EmitUInt32(byte* code, ref int offset, uint value)
